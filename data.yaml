@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 7
+names: ['angry', 'disgust', 'fear', 'happy', 'neutral', 'sad', 'surprise']
+
+roboflow:
+  workspace: adalrhman
+  project: facial-emotion-trpg7
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/adalrhman/facial-emotion-trpg7/dataset/1

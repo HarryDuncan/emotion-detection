@@ -2,3 +2,6 @@
 test/*
 valid/*
 train/*
+.environment/*
+venv/*
+.venv/*

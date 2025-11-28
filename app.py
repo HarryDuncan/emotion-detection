@@ -1,8 +1,8 @@
-from flask import Flask, render_template, request, jsonify, Response, stream_with_context
+from flask import Flask, jsonify, Response
 from flask_cors import CORS
 import cv2
-import requests
-import json
+# import requests  # Commented out - chat functionality removed
+# import json  # Commented out - chat functionality removed
 import time
 import threading
 from collections import deque
@@ -10,24 +10,38 @@ import numpy as np
 from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
 from emotion_detection.emotion_detector import EmotionDetector
 from emotion_detection.utils import convert_numpy_types
-from prompt_formatting.format_prompt import format_dominant_emotion
-from prompt_formatting.structure import QuizResponse
+# from prompt_formatting.format_prompt import format_dominant_emotion  # Commented out - chat functionality removed
+# from prompt_formatting.structure import QuizResponse  # Commented out - chat functionality removed
 app = Flask(__name__)
 CORS(app)
 
 # Initialize classes
 camera_input = CameraInput(DEFAULT_CAMERA_CONFIG)
 emotion_detector = EmotionDetector()
-json_schema = QuizResponse.model_json_schema()
+# json_schema = QuizResponse.model_json_schema()  # Commented out - chat functionality removed
+
 # Flag to control continuous emotion detection
 emotion_detection_running = False
 emotion_detection_thread = None
+
+# Process status constants
+PROCESS_STATUS = {
+    'UNINITIALIZED': 'UNINITIALIZED',
+    'INITIALIZED': 'INITIALIZED',
+    'RUNNING': 'RUNNING',
+    'PAUSED': 'PAUSED',
+    'STOPPED': 'STOPPED'
+}
+
+# State management
+initialized = False
+process_status = PROCESS_STATUS['UNINITIALIZED']
 
 # Initialization status
 initialization_status = {
     'camera_ready': False,
     'models_loaded': False,
-    'initializing': True
+    'initializing': False
 }
 
 # Global variables for emotion detection
@@ -122,10 +136,11 @@ def continuous_emotion_detection():
 
 def start_continuous_emotion_detection():
     """Start continuous emotion detection in background thread"""
-    global emotion_detection_running, emotion_detection_thread
+    global emotion_detection_running, emotion_detection_thread, process_status
     
     if not emotion_detection_running:
         emotion_detection_running = True
+        process_status = PROCESS_STATUS['RUNNING']
         emotion_detection_thread = threading.Thread(target=continuous_emotion_detection, daemon=True)
         emotion_detection_thread.start()
         return True
@@ -133,8 +148,9 @@ def start_continuous_emotion_detection():
 
 def stop_continuous_emotion_detection():
     """Stop continuous emotion detection"""
-    global emotion_detection_running
+    global emotion_detection_running, process_status
     emotion_detection_running = False
+    process_status = PROCESS_STATUS['STOPPED']
 
 def get_latest_emotions():
     """Get the latest emotion data"""
@@ -144,134 +160,245 @@ def get_latest_emotions():
     data['scores_out_of_10'] = convert_numpy_types(data['scores_out_of_10'])
     return data
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+@app.route('/initialize', methods=['POST'])
+def initialize():
+    """Initialize camera and models"""
+    global initialized, initialization_status, process_status
+    
+    try:
+        print("Starting initialization...")
+        
+        # Load emotion detection models
+        emotion_detector.load_models()
+        
+        # Initialize camera
+        camera_input._initialize_camera()
+        
+        # Verify initialization
+        initialize_system()
+        
+        # Check if initialization was successful
+        if initialization_status['camera_ready'] and initialization_status['models_loaded']:
+            initialized = True
+            process_status = PROCESS_STATUS['INITIALIZED']
+            return jsonify({
+                'status': 'success',
+                'message': 'System initialized successfully',
+                'processStatus': process_status,
+                'optionalMessageData': {
+                    'camera_ready': initialization_status['camera_ready'],
+                    'models_loaded': initialization_status['models_loaded']
+                }
+            })
+        else:
+            process_status = PROCESS_STATUS['UNINITIALIZED']
+            return jsonify({
+                'status': 'error',
+                'message': 'Initialization failed',
+                'processStatus': process_status,
+                'optionalMessageData': {
+                    'camera_ready': initialization_status['camera_ready'],
+                    'models_loaded': initialization_status['models_loaded']
+                }
+            }), 500
+    except Exception as e:
+        print(f"Error during initialization: {e}")
+        process_status = PROCESS_STATUS['UNINITIALIZED']
+        return jsonify({
+            'status': 'error',
+            'message': f'Initialization error: {str(e)}',
+            'processStatus': process_status,
+            'optionalMessageData': None
+        }), 500
 
-@app.route('/status', methods=['GET'])
-def get_status():
-    """Get initialization status"""
-    return jsonify(initialization_status)
-
-@app.route('/start_detection', methods=['POST'])
-def start_detection():
+@app.route('/run', methods=['POST'])
+def run():
     """Start continuous emotion detection"""
+    global initialized, process_status
+    
+    if not initialized:
+        return jsonify({
+            'status': 'error',
+            'message': 'System not initialized. Please call /initialize first.',
+            'processStatus': process_status,
+            'optionalMessageData': None
+        }), 400
+    
     if start_continuous_emotion_detection():
-        return jsonify({'status': 'started', 'message': 'Continuous emotion detection started'})
+        return jsonify({
+            'status': 'success',
+            'message': 'Continuous emotion detection started',
+            'processStatus': process_status,
+            'optionalMessageData': None
+        })
     else:
-        return jsonify({'status': 'already_running', 'message': 'Emotion detection already running'})
+        # Already running, but status should still be RUNNING
+        if process_status != PROCESS_STATUS['RUNNING']:
+            process_status = PROCESS_STATUS['RUNNING']
+        return jsonify({
+            'status': 'error',
+            'message': 'Emotion detection already running',
+            'processStatus': process_status,
+            'optionalMessageData': None
+        })
 
-@app.route('/stop_detection', methods=['POST'])
-def stop_detection():
+@app.route('/stop', methods=['POST'])
+def stop():
     """Stop continuous emotion detection"""
+    global process_status
     stop_continuous_emotion_detection()
-    return jsonify({'status': 'stopped', 'message': 'Emotion detection stopped'})
+    return jsonify({
+        'status': 'success',
+        'message': 'Emotion detection stopped',
+        'processStatus': process_status,
+        'optionalMessageData': None
+    })
 
-@app.route('/get_emotions', methods=['GET'])
-def get_emotions():
-    """Get current emotion data"""
-    data = get_latest_emotions()
-    return jsonify(data)
-
-@app.route('/chat', methods=['POST'])
-def chat():
-    """Handle chat with Ollama, including emotion data"""
-    user_message = request.json.get('message', '')
-    
-    # Get latest emotion data
-    emotion_info = get_latest_emotions()
-    
-    # Format emotion string
-    if emotion_info['emotions']:
-        emotion_string = format_dominant_emotion(emotion_info['emotions'])
-        print(emotion_string)
-        emotion_context = f"\n\nCurrent emotional state: {emotion_string}."
-    else:
-        emotion_context = "\n\nNote: No emotion data available yet. Please start emotion detection first."
-    
-    # Create the prompt with emotion context
-    full_prompt = f"{user_message}{emotion_context}\n\nWhat do you know about these emotions? Please ask me a question about them."
-    
-    # Prepare Ollama request
-    url = "http://localhost:11434/api/chat"
-    payload = {
-        "model": "machine",
-        "messages": [{"role": "user", "content": full_prompt}],
-        "schema": json_schema,
-        "stream": True
-    }
-    
-    def generate():
-        try:
-            response = requests.post(url, json=payload, stream=True)
-            
-            if response.status_code == 200:
-                for line in response.iter_lines(decode_unicode=True):
-                    if line:
-                        try:
-                            json_data = json.loads(line)
-                            if "message" in json_data and "content" in json_data["message"]:
-                                content = json_data["message"]["content"]
-                                yield f"data: {json.dumps({'content': content, 'done': json_data.get('done', False)})}\n\n"
-                        except json.JSONDecodeError:
-                            continue
-            else:
-                yield f"data: {json.dumps({'error': f'Error: {response.status_code}'})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-    
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
-@app.route('/video_feed')
+@app.route('/video_feed', methods=['GET'])
 def video_feed():
-    """Video streaming route - reads directly from camera"""
-    def generate():
-        while True:
-            # Get frame from camera_input
-            ret, frame = camera_input.read_flipped()
-            
-            if not ret or frame is None:
-                time.sleep(0.1)
-                continue
-            
-            # Detect emotions using emotion_detector class
-            result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
-            
-            if result and result['face_detected']:
-                x, y, w, h = result['face_bbox']
-                color = result['emotion_color_bgr']
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            
-            # Encode frame as JPEG
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if ret:
-                frame_bytes = buffer.tobytes()
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
-            time.sleep(0.03)  # ~30 FPS
+    """Get the latest frame from the camera"""
+    global process_status
+    try:
+        # Read the latest frame from camera
+        ret, frame = camera_input.read_flipped()
+        
+        if not ret or frame is None:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to read frame from camera',
+                'processStatus': process_status,
+                'optionalMessageData': None
+            }), 500
+        
+        # Encode frame as JPEG
+        ret, buffer = cv2.imencode('.jpg', frame)
+        if not ret:
+            return jsonify({
+                'status': 'error',
+                'message': 'Failed to encode frame',
+                'processStatus': process_status,
+                'optionalMessageData': None
+            }), 500
+        
+        # Return the image
+        frame_bytes = buffer.tobytes()
+        return Response(frame_bytes, mimetype='image/jpeg')
     
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': f'Error reading frame: {str(e)}',
+            'processStatus': process_status,
+            'optionalMessageData': None
+        }), 500
+
+# Commented out routes - chat functionality removed
+# @app.route('/')
+# def index():
+#     return render_template('index.html')
+#
+# @app.route('/status', methods=['GET'])
+# def get_status():
+#     """Get initialization status"""
+#     return jsonify(initialization_status)
+#
+# @app.route('/get_emotions', methods=['GET'])
+# def get_emotions():
+#     """Get current emotion data"""
+#     data = get_latest_emotions()
+#     return jsonify(data)
+#
+# @app.route('/chat', methods=['POST'])
+# def chat():
+#     """Handle chat with Ollama, including emotion data"""
+#     user_message = request.json.get('message', '')
+#     
+#     # Get latest emotion data
+#     emotion_info = get_latest_emotions()
+#     
+#     # Format emotion string
+#     if emotion_info['emotions']:
+#         emotion_string = format_dominant_emotion(emotion_info['emotions'])
+#         print(emotion_string)
+#         emotion_context = f"\n\nCurrent emotional state: {emotion_string}."
+#     else:
+#         emotion_context = "\n\nNote: No emotion data available yet. Please start emotion detection first."
+#     
+#     # Create the prompt with emotion context
+#     full_prompt = f"{user_message}{emotion_context}\n\nWhat do you know about these emotions? Please ask me a question about them."
+#     
+#     # Prepare Ollama request
+#     url = "http://localhost:11434/api/chat"
+#     payload = {
+#         "model": "machine",
+#         "messages": [{"role": "user", "content": full_prompt}],
+#         "schema": json_schema,
+#         "stream": True
+#     }
+#     
+#     def generate():
+#         try:
+#             response = requests.post(url, json=payload, stream=True)
+#             
+#             if response.status_code == 200:
+#                 for line in response.iter_lines(decode_unicode=True):
+#                     if line:
+#                         try:
+#                             json_data = json.loads(line)
+#                             if "message" in json_data and "content" in json_data["message"]:
+#                                 content = json_data["message"]["content"]
+#                                 yield f"data: {json.dumps({'content': content, 'done': json_data.get('done', False)})}\n\n"
+#                         except json.JSONDecodeError:
+#                             continue
+#             else:
+#                 yield f"data: {json.dumps({'error': f'Error: {response.status_code}'})}\n\n"
+#         except Exception as e:
+#             yield f"data: {json.dumps({'error': str(e)})}\n\n"
+#     
+#     return Response(stream_with_context(generate()), mimetype='text/event-stream')
+#
+# @app.route('/video_feed')
+# def video_feed():
+#     """Video streaming route - reads directly from camera"""
+#     def generate():
+#         while True:
+#             # Get frame from camera_input
+#             ret, frame = camera_input.read_flipped()
+#             
+#             if not ret or frame is None:
+#                 time.sleep(0.1)
+#                 continue
+#             
+#             # Detect emotions using emotion_detector class
+#             result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+#             
+#             if result and result['face_detected']:
+#                 x, y, w, h = result['face_bbox']
+#                 color = result['emotion_color_bgr']
+#                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+#             
+#             # Encode frame as JPEG
+#             ret, buffer = cv2.imencode('.jpg', frame)
+#             if ret:
+#                 frame_bytes = buffer.tobytes()
+#                 yield (b'--frame\r\n'
+#                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+#             
+#             time.sleep(0.03)  # ~30 FPS
+#     
+#     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
     import os
+    import atexit
     
-    # Only initialize in the actual Flask process, not the reloader parent process
-    if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
-        # Initialize system (camera and models) synchronously before starting Flask
-        print("Starting initialization...")
-        emotion_detector.load_models()
-        camera_input._initialize_camera()
-        initialize_system()
-        
-        # Start continuous emotion detection automatically
-        start_continuous_emotion_detection()
-        
-        # Cleanup on exit
-        import atexit
-        def cleanup():
+    # Cleanup on exit
+    def cleanup():
+        global initialized, process_status
+        if initialized:
             print("Cleaning up...")
             stop_continuous_emotion_detection()
+            process_status = PROCESS_STATUS['STOPPED']
             try:
                 camera_input.release()
             except:
@@ -281,8 +408,8 @@ if __name__ == '__main__':
             except:
                 pass
             print("Cleanup complete")
-        
-        atexit.register(cleanup)
+    
+    atexit.register(cleanup)
     
     # Get port from environment variable or use default
     port = int(os.environ.get('PORT', 5005))

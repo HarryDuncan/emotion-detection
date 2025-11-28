@@ -1,0 +1,102 @@
+import cv2
+from deepface import DeepFace
+from emotion_transforms import emotions_to_color
+
+# Load face cascade classifier (module-level for reuse)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+
+def detect_emotions_from_frame(frame, silent=True):
+    """
+    Detect emotions from a single frame.
+    
+    Args:
+        frame: BGR frame from OpenCV (numpy array)
+        silent: Whether to suppress DeepFace warnings (default: True)
+    
+    Returns:
+        dict: {
+            'emotions': dict of emotion scores (0-100),
+            'dominant_emotion': str,
+            'emotion_color_rgb': tuple (R, G, B),
+            'emotion_color_bgr': tuple (B, G, R),
+            'face_detected': bool,
+            'face_bbox': tuple (x, y, w, h) or None
+        }
+        Returns None if no face detected or error occurred.
+    """
+    try:
+        # Convert frame to grayscale for face detection
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Convert grayscale frame to RGB format for DeepFace
+        rgb_frame = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB)
+        
+        # Detect faces in the frame
+        faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.05, minNeighbors=7, minSize=(50, 50))
+        
+        if len(faces) == 0:
+            return {
+                'emotions': {},
+                'dominant_emotion': None,
+                'emotion_color_rgb': (0, 0, 0),
+                'emotion_color_bgr': (0, 0, 0),
+                'face_detected': False,
+                'face_bbox': None
+            }
+        
+        # Use the first detected face
+        (x, y, w, h) = faces[0]
+        
+        # Extract the face ROI (Region of Interest)
+        face_roi = rgb_frame[y:y + h, x:x + w]
+        
+        # Perform emotion analysis on the face ROI
+        result = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False, silent=silent)
+        
+        # Get all emotions from the result
+        emotions = result[0]['emotion']
+        dominant_emotion = result[0]['dominant_emotion']
+        
+        # Convert emotions to RGB color
+        emotion_color_rgb = emotions_to_color(emotions)
+        # Convert RGB to BGR for OpenCV (OpenCV uses BGR format)
+        emotion_color_bgr = (int(emotion_color_rgb[2]), int(emotion_color_rgb[1]), int(emotion_color_rgb[0]))
+        
+        return {
+            'emotions': emotions,
+            'dominant_emotion': dominant_emotion,
+            'emotion_color_rgb': emotion_color_rgb,
+            'emotion_color_bgr': emotion_color_bgr,
+            'face_detected': True,
+            'face_bbox': (x, y, w, h)
+        }
+    
+    except Exception as e:
+        print(f"Error in emotion detection: {e}")
+        return {
+            'emotions': {},
+            'dominant_emotion': None,
+            'emotion_color_rgb': (0, 0, 0),
+            'emotion_color_bgr': (0, 0, 0),
+            'face_detected': False,
+            'face_bbox': None,
+            'error': str(e)
+        }
+
+
+# Note: This module only works with frames, not cameras.
+# Camera management should be handled by the calling code (e.g., app.py)
+# This ensures only one camera instance exists and avoids conflicts.
+
+# For standalone testing, use detect.py with a frame source from elsewhere
+if __name__ == "__main__":
+    # Example standalone usage - requires frame from external source
+    print("This module requires frames to be passed in.")
+    print("Use detect_emotions_from_frame(frame) with a frame from your camera.")
+    print("\nExample:")
+    print("  import cv2")
+    print("  from detect import detect_emotions_from_frame")
+    print("  cap = cv2.VideoCapture(0)")
+    print("  ret, frame = cap.read()")
+    print("  result = detect_emotions_from_frame(frame)")

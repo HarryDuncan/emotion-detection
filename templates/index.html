@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Emotion Detection Chat</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      body {
+        font-family: Arial, sans-serif;
+        display: flex;
+        height: 100vh;
+        background: #1a1a1a;
+        color: #fff;
+      }
+
+      .container {
+        display: flex;
+        width: 100%;
+      }
+
+      .video-section {
+        flex: 1;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .video-container {
+        position: relative;
+        border: 2px solid #333;
+        border-radius: 10px;
+        overflow: hidden;
+        margin-bottom: 20px;
+      }
+
+      .video-container img {
+        max-width: 100%;
+        height: auto;
+      }
+
+      .emotion-display {
+        background: #2a2a2a;
+        padding: 15px;
+        border-radius: 10px;
+        min-width: 300px;
+        margin-bottom: 20px;
+      }
+
+      .emotion-display h3 {
+        margin-bottom: 10px;
+        color: #4caf50;
+      }
+
+      .emotion-item {
+        display: flex;
+        justify-content: space-between;
+        padding: 5px 0;
+        border-bottom: 1px solid #333;
+      }
+
+      button {
+        background: #4caf50;
+        color: white;
+        border: none;
+        padding: 10px 20px;
+        border-radius: 5px;
+        cursor: pointer;
+        font-size: 16px;
+        margin: 5px;
+      }
+
+      button:hover {
+        background: #45a049;
+      }
+
+      button:disabled {
+        background: #666;
+        cursor: not-allowed;
+      }
+
+      .chat-section {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        border-left: 2px solid #333;
+        padding: 20px;
+      }
+
+      .chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px;
+        background: #2a2a2a;
+        border-radius: 10px;
+        margin-bottom: 20px;
+      }
+
+      .message {
+        margin-bottom: 15px;
+        padding: 10px;
+        border-radius: 5px;
+      }
+
+      .message.user {
+        background: #4caf50;
+        text-align: right;
+      }
+
+      .message.assistant {
+        background: #333;
+      }
+
+      .chat-input-container {
+        display: flex;
+        gap: 10px;
+      }
+
+      #chat-input {
+        flex: 1;
+        padding: 10px;
+        border: 1px solid #333;
+        border-radius: 5px;
+        background: #2a2a2a;
+        color: #fff;
+        font-size: 16px;
+      }
+
+      #send-button {
+        padding: 10px 30px;
+      }
+
+      .status {
+        padding: 10px;
+        margin-bottom: 10px;
+        border-radius: 5px;
+        text-align: center;
+      }
+
+      .status.collecting {
+        background: #ff9800;
+        color: #000;
+      }
+
+      .status.ready {
+        background: #4caf50;
+      }
+
+      /* Loading screen styles */
+      #loading-screen {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: #1a1a1a;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        z-index: 1000;
+      }
+
+      .loading-spinner {
+        border: 4px solid #333;
+        border-top: 4px solid #4caf50;
+        border-radius: 50%;
+        width: 50px;
+        height: 50px;
+        animation: spin 1s linear infinite;
+        margin-bottom: 20px;
+      }
+
+      @keyframes spin {
+        0% {
+          transform: rotate(0deg);
+        }
+        100% {
+          transform: rotate(360deg);
+        }
+      }
+
+      .loading-text {
+        font-size: 18px;
+        color: #fff;
+        margin-bottom: 10px;
+      }
+
+      .loading-status {
+        font-size: 14px;
+        color: #888;
+      }
+
+      .main-content {
+        display: none;
+      }
+
+      .main-content.ready {
+        display: flex;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- Loading Screen -->
+    <div id="loading-screen">
+      <div class="loading-spinner"></div>
+      <div class="loading-text">Initializing Emotion Detection</div>
+      <div class="loading-status" id="loading-status">Loading models...</div>
+    </div>
+
+    <!-- Main Content -->
+    <div class="container main-content" id="main-content">
+      <div class="video-section">
+        <h2>Emotion Detection</h2>
+        <div class="video-container">
+          <img id="video-feed" src="/video_feed" alt="Video Feed" />
+        </div>
+
+        <div id="status" class="status ready">
+          Ready - Continuous Detection Active
+        </div>
+
+        <div class="emotion-display">
+          <h3>Current Emotions (out of 10)</h3>
+          <div id="emotion-list">
+            <p>
+              Detecting emotions continuously... Waiting for face detection.
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="chat-section">
+        <h2>Chat with AI</h2>
+        <div class="chat-messages" id="chat-messages">
+          <div class="message assistant">
+            <p>
+              Hello! I can see your emotions and help you understand them. Start
+              emotion detection first, then ask me anything!
+            </p>
+          </div>
+        </div>
+        <div class="chat-input-container">
+          <input
+            type="text"
+            id="chat-input"
+            placeholder="Type your message here..."
+          />
+          <button id="send-button">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const loadingScreen = document.getElementById("loading-screen");
+      const mainContent = document.getElementById("main-content");
+      const loadingStatus = document.getElementById("loading-status");
+      const statusDiv = document.getElementById("status");
+      const emotionList = document.getElementById("emotion-list");
+      const chatMessages = document.getElementById("chat-messages");
+      const chatInput = document.getElementById("chat-input");
+      const sendButton = document.getElementById("send-button");
+
+      let emotionUpdateInterval;
+
+      // Check initialization status
+      function checkStatus() {
+        fetch("/status")
+          .then((res) => res.json())
+          .then((data) => {
+            // Update loading status
+            console.log(data);
+            if (data.initializing) {
+              let statusText = "Initializing...";
+              if (data.models_loaded && !data.camera_ready) {
+                statusText = "Models loaded. Starting camera...";
+              } else if (!data.models_loaded) {
+                statusText = "Loading emotion detection models...";
+              }
+              loadingStatus.textContent = statusText;
+            } else {
+              // Everything is ready
+              if (data.camera_ready && data.models_loaded) {
+                // Hide loading screen and show main content
+                loadingScreen.style.display = "none";
+                mainContent.classList.add("ready");
+                // Start emotion updates
+                emotionUpdateInterval = setInterval(updateEmotions, 1000);
+                updateEmotions();
+              } else {
+                loadingStatus.textContent =
+                  "Initialization failed. Please refresh.";
+              }
+            }
+          })
+          .catch((error) => {
+            console.error("Error checking status:", error);
+            loadingStatus.textContent = "Error connecting to server...";
+          });
+      }
+
+      // Check status every 500ms until ready
+      const statusInterval = setInterval(() => {
+        checkStatus();
+        fetch("/status")
+          .then((res) => res.json())
+          .then((data) => {
+            if (!data.initializing && data.camera_ready && data.models_loaded) {
+              clearInterval(statusInterval);
+            }
+          });
+      }, 500);
+
+      // Initial check
+      checkStatus();
+
+      // Continuous emotion detection starts automatically on server startup
+      // No manual start button needed
+
+      // Update emotions display
+      function updateEmotions() {
+        fetch("/get_emotions")
+          .then((res) => res.json())
+          .then((data) => {
+            if (
+              data.scores_out_of_10 &&
+              Object.keys(data.scores_out_of_10).length > 0
+            ) {
+              let html = "";
+              for (const [emotion, score] of Object.entries(
+                data.scores_out_of_10
+              )) {
+                html += `<div class="emotion-item">
+                                <span>${
+                                  emotion.charAt(0).toUpperCase() +
+                                  emotion.slice(1)
+                                }</span>
+                                <span>${score}/10</span>
+                            </div>`;
+              }
+              emotionList.innerHTML = html;
+            }
+          });
+      }
+
+      // Emotion updates will start after initialization
+
+      // Send chat message
+      function sendMessage() {
+        const message = chatInput.value.trim();
+        if (!message) return;
+
+        // Add user message to chat
+        const userMsgDiv = document.createElement("div");
+        userMsgDiv.className = "message user";
+        userMsgDiv.innerHTML = `<p>${message}</p>`;
+        chatMessages.appendChild(userMsgDiv);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+
+        chatInput.value = "";
+        sendButton.disabled = true;
+
+        // Create assistant message div
+        const assistantMsgDiv = document.createElement("div");
+        assistantMsgDiv.className = "message assistant";
+        assistantMsgDiv.innerHTML = "<p></p>";
+        chatMessages.appendChild(assistantMsgDiv);
+        const p = assistantMsgDiv.querySelector("p");
+
+        // Use fetch with POST and handle SSE stream manually
+        fetch("/chat", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ message: message }),
+        })
+          .then((response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP error! status: ${response.status}`);
+            }
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+
+            function readStream() {
+              reader
+                .read()
+                .then(({ done, value }) => {
+                  if (done) {
+                    sendButton.disabled = false;
+                    return;
+                  }
+
+                  const chunk = decoder.decode(value, { stream: true });
+                  const lines = chunk.split("\n\n");
+
+                  for (const line of lines) {
+                    if (line.startsWith("data: ")) {
+                      try {
+                        const data = JSON.parse(line.substring(6));
+                        if (data.error) {
+                          p.textContent = `Error: ${data.error}`;
+                          sendButton.disabled = false;
+                          return;
+                        } else {
+                          p.textContent += data.content || "";
+                          chatMessages.scrollTop = chatMessages.scrollHeight;
+                          if (data.done) {
+                            sendButton.disabled = false;
+                            return;
+                          }
+                        }
+                      } catch (e) {
+                        // Skip malformed JSON
+                        console.error("Error parsing SSE data:", e);
+                      }
+                    }
+                  }
+
+                  readStream(); // Continue reading
+                })
+                .catch((error) => {
+                  console.error("Stream error:", error);
+                  p.textContent = `Error: ${error.message}`;
+                  sendButton.disabled = false;
+                });
+            }
+
+            readStream();
+          })
+          .catch((error) => {
+            console.error("Fetch error:", error);
+            p.textContent = `Error: ${error.message}`;
+            sendButton.disabled = false;
+          });
+      }
+
+      sendButton.addEventListener("click", sendMessage);
+      chatInput.addEventListener("keypress", (e) => {
+        if (e.key === "Enter") {
+          sendMessage();
+        }
+      });
+    </script>
+  </body>
+</html>

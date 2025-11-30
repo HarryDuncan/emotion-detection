@@ -30,9 +30,7 @@ class CameraInput:
 
     def _initialize_camera(self):
         print("Initializing camera")
-        if self.video_capture is not None:
-            self.video_capture.release()
-        else:
+        if self.video_capture is None:
             self.video_capture = cv2.VideoCapture(0)
 
         if not self.video_capture.isOpened():
@@ -102,7 +100,9 @@ class CameraInput:
         return ret, frame
     
     def release(self):
-        self.video_capture.release()
+        if self.video_capture is not None:
+            self.video_capture.release()
+            self.video_capture = None
     
     def get_video_capture(self):
         return self.video_capture

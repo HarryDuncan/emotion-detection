@@ -23,7 +23,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Initialize classes
 camera_input = CameraInput(DEFAULT_CAMERA_CONFIG)
-emotion_detector = EmotionDetector()
+emotion_detector = EmotionDetector(fast_mode=True)
 # json_schema = QuizResponse.model_json_schema()  # Commented out - chat functionality removed
 
 # Flag to control continuous emotion detection
@@ -143,16 +143,23 @@ def annotate_frame_with_model_data(frame, detection_result):
     # Draw bounding box if face is detected (emotion detection specific)
     if detection_result.get('face_detected', False):
         face_bbox = detection_result.get('face_bbox')
+        dominant_emotion = detection_result.get('dominant_emotion')
+        color = detection_result.get('emotion_color_bgr', (0, 255, 0))
+        
         if face_bbox:
             x, y, w, h = face_bbox
-            color = detection_result.get('emotion_color_bgr', (0, 255, 0))
             cv2.rectangle(annotated_frame, (x, y), (x + w, y + h), color, 2)
             
-            # Optionally add text label
-            dominant_emotion = detection_result.get('dominant_emotion')
+            # Add text label with dominant emotion
             if dominant_emotion:
-                cv2.putText(annotated_frame, dominant_emotion, (x, y - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                # Position text above the bounding box, or at top-left if bbox is at top
+                text_y = max(y - 10, 30) if y > 30 else y + h + 25
+                cv2.putText(annotated_frame, dominant_emotion.upper(), (x, text_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        elif dominant_emotion:
+            # If no bbox but we have emotion, show it at top-left
+            cv2.putText(annotated_frame, f"Emotion: {dominant_emotion.upper()}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     
     # Add other model-specific annotations here
     # This function can be extended for other models
@@ -174,7 +181,7 @@ def continuous_emotion_detection():
             continue
         
         # Use the emotion detector class
-        result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+        result = emotion_detector.detect_emotions_from_frame(frame, silent=False)
         
         # Store frame and detection result for video feed (thread-safe)
         with latest_frame_data['lock']:

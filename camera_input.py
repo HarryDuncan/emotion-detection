@@ -4,12 +4,12 @@ import time
 
 
 DEFAULT_CAMERA_CONFIG = {
-    'camera_fps': 30,
+    'camera_fps': 25,
     'camera_fps_adaptive': True,
     'camera_fps_min': 15,
     'camera_fps_max': 60,
     'camera_index': 0,
-    'camera_flip_horizontal': True,  
+    'camera_flip_horizontal': False,  
 }
 
 class CameraInput:

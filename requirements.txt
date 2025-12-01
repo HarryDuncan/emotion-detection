@@ -1,1 +1,2 @@
 flask-socketio
+cython>=3.0.0

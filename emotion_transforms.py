@@ -12,13 +12,13 @@ def emotions_to_color(emotions_dict):
         tuple: (R, G, B) color values in range 0-255
     """
     # Define color mapping for each emotion (RGB values 0-255)
-    # Neutral is at origin (0, 0, 0) - black
+    # Neutral is white for better visibility
     emotion_colors = {
-        'neutral': (0, 0, 0),        # Black (origin)
-        'happy': (255, 255, 0),      # Yellow
+        'neutral': (255, 255, 255),  # White
+        'happy': (255, 215, 0),      # Gold/Yellow (more distinct from surprise)
         'sad': (0, 0, 255),          # Blue
         'angry': (255, 0, 0),        # Red
-        'surprise': (255, 165, 0),   # Orange
+        'surprise': (255, 20, 147),  # Deep Pink/Magenta (very distinct)
         'fear': (128, 0, 128),       # Purple
         'disgust': (0, 128, 0),      # Green
     }
@@ -32,7 +32,7 @@ def emotions_to_color(emotions_dict):
         weight = confidence / 100.0
         
         # Get emotion color (default to neutral if emotion not in mapping)
-        emotion_rgb = np.array(emotion_colors.get(emotion.lower(), (0, 0, 0)))
+        emotion_rgb = np.array(emotion_colors.get(emotion.lower(), (255, 255, 255)))
         
         # Add weighted color vector
         weighted_rgb += emotion_rgb * weight
@@ -50,13 +50,13 @@ def emotions_to_color_normalized(emotions_dict):
     Useful if confidences don't sum to exactly 100.
     """
     emotion_colors = {
-        'neutral': (0, 0, 0),
-        'happy': (255, 255, 0),
-        'sad': (0, 0, 255),
-        'angry': (255, 0, 0),
-        'surprise': (255, 165, 0),
-        'fear': (128, 0, 128),
-        'disgust': (0, 128, 0),
+        'neutral': (255, 255, 255),  # White
+        'happy': (255, 215, 0),      # Gold/Yellow (more distinct from surprise)
+        'sad': (0, 0, 255),          # Blue
+        'angry': (255, 0, 0),        # Red
+        'surprise': (255, 20, 147),  # Deep Pink/Magenta (very distinct)
+        'fear': (128, 0, 128),       # Purple
+        'disgust': (0, 128, 0),      # Green
     }
     
     weighted_rgb = np.array([0.0, 0.0, 0.0])
@@ -70,7 +70,7 @@ def emotions_to_color_normalized(emotions_dict):
         # Normalize by total confidence so weights sum to 1
         weight = confidence / total_confidence
         
-        emotion_rgb = np.array(emotion_colors.get(emotion.lower(), (0, 0, 0)))
+        emotion_rgb = np.array(emotion_colors.get(emotion.lower(), (255, 255, 255)))
         weighted_rgb += emotion_rgb * weight
     
     final_rgb = np.clip(weighted_rgb, 0, 255).astype(int)

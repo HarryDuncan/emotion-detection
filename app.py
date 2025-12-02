@@ -225,6 +225,60 @@ def annotate_frame_with_model_data(frame, detection_result, show_only_face_box=F
         # Normal mode, no face detected
         annotated_frame = frame.copy()
     
+    # Colorize the face bounding box area with emotion color if available
+    if detection_result and detection_result.get('face_detected', False):
+        face_bbox = detection_result.get('face_bbox')
+        emotion_color_bgr = detection_result.get('emotion_color_bgr')
+        if face_bbox and emotion_color_bgr:
+            x, y, w, h = face_bbox
+            overlay_alpha = 0.35
+            
+            if show_only_face_box:
+                # In face-only mode, colorize the resized face area in the 200x200 frame
+                # Recalculate the face area coordinates in the 200x200 frame
+                x1 = max(0, x)
+                y1 = max(0, y)
+                x2 = min(frame.shape[1], x + w)
+                y2 = min(frame.shape[0], y + h)
+                face_h, face_w = (y2 - y1, x2 - x1)
+                
+                if face_w > 0 and face_h > 0:
+                    box_size = 180
+                    scale = min(box_size / face_w, box_size / face_h)
+                    new_w = int(face_w * scale)
+                    new_h = int(face_h * scale)
+                    start_x = (200 - new_w) // 2
+                    start_y = (200 - new_h) // 2
+                    
+                    # Extract the face ROI from annotated frame
+                    face_roi = annotated_frame[start_y:start_y + new_h, start_x:start_x + new_w]
+                    if face_roi.size > 0:
+                        # Create color overlay for the face ROI
+                        color_overlay = np.full_like(face_roi, emotion_color_bgr, dtype=np.uint8)
+                        # Apply color overlay to face ROI
+                        colored_face_roi = cv2.addWeighted(face_roi, 1.0 - overlay_alpha,
+                                                           color_overlay, overlay_alpha, 0)
+                        # Put the colored ROI back into the annotated frame
+                        annotated_frame[start_y:start_y + new_h, start_x:start_x + new_w] = colored_face_roi
+            else:
+                # Normal mode: colorize only the face bounding box area
+                # Ensure coordinates are within frame bounds
+                x1 = max(0, x)
+                y1 = max(0, y)
+                x2 = min(annotated_frame.shape[1], x + w)
+                y2 = min(annotated_frame.shape[0], y + h)
+                
+                # Extract the face ROI from annotated frame
+                face_roi = annotated_frame[y1:y2, x1:x2]
+                if face_roi.size > 0:
+                    # Create color overlay for the face ROI
+                    color_overlay = np.full_like(face_roi, emotion_color_bgr, dtype=np.uint8)
+                    # Apply color overlay to face ROI
+                    colored_face_roi = cv2.addWeighted(face_roi, 1.0 - overlay_alpha,
+                                                       color_overlay, overlay_alpha, 0)
+                    # Put the colored ROI back into the annotated frame
+                    annotated_frame[y1:y2, x1:x2] = colored_face_roi
+    
     # Add other model-specific annotations here
     # This function can be extended for other models
     

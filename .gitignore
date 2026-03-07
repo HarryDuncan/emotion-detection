@@ -1,7 +1,56 @@
-*.env
-test/*
-valid/*
-train/*
-.environment/*
-venv/*
-.venv/*
+# Byte-compiled / cached
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Installs / build
+tf-gpu/
+build/
+dist/
+*.egg-info/
+*.egg
+*.whl
+
+# Package / system
+*.deb
+*.rpm
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Testing / tools
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Env and secrets
+.env
+.env.local
+*.pem
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/

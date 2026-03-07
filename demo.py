@@ -1,14 +1,25 @@
-import cv2
+
 import time
-from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
-from emotion_detection.emotion_detector import EmotionDetector
-from emotion_detection.utils import convert_numpy_types
+import socket
+import os
+import warnings
+import logging
+import cv2
+
+# Suppress warnings before importing TensorFlow
+warnings.filterwarnings("ignore")
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # Suppress TensorFlow C++ logs (0=all, 1=info, 2=warnings, 3=errors)
+
+from detector.emotion_detector import EmotionDetector
+from detector.utils import convert_numpy_types
 from emotion_transforms import emotions_to_color
 
 # Try to import TensorFlow for GPU checking
 try:
     import tensorflow as tf
     TENSORFLOW_AVAILABLE = True
+    # Set TensorFlow logger to ERROR level to suppress warnings
+    tf.get_logger().setLevel(logging.ERROR)
 except ImportError:
     TENSORFLOW_AVAILABLE = False
     tf = None
@@ -41,15 +52,15 @@ def display_emotion_data(emotions, dominant_emotion, emotion_color_rgb, emotion_
         bar = "█" * bar_length
         print(f"  {emotion.upper():12s}: {score:6.2f}% [{bar}]")
     
-    # Display colors
-    print("\nEmotion Colors:")
-    print("-" * 60)
-    print(f"  RGB Color: {format_color_display(emotion_color_rgb)}")
-    print(f"  BGR Color: {format_color_display(emotion_color_bgr)}")
+    # # Display colors
+    # print("\nEmotion Colors:")
+    # print("-" * 60)
+    # print(f"  RGB Color: {format_color_display(emotion_color_rgb)}")
+    # print(f"  BGR Color: {format_color_display(emotion_color_bgr)}")
     
-    # Display individual emotion colors
-    print("\nIndividual Emotion Colors:")
-    print("-" * 60)
+    # # Display individual emotion colors
+    # print("\nIndividual Emotion Colors:")
+    # print("-" * 60)
     emotion_colors_map = {
         'neutral': (255, 255, 255),
         'happy': (255, 215, 0),
@@ -64,7 +75,7 @@ def display_emotion_data(emotions, dominant_emotion, emotion_color_rgb, emotion_
         emotion_name = emotion[0]
         if emotion_name in emotion_colors_map:
             color = emotion_colors_map[emotion_name]
-            print(f"  {emotion_name.upper():12s}: RGB{color}")
+           
     
     print("="*60 + "\n")
 
@@ -132,7 +143,7 @@ def check_and_configure_gpu():
         return False
     
     try:
-        # Check GPU availability
+        # 1. Get the list of GPUs
         gpus = tf.config.list_physical_devices('GPU')
         
         if gpus:
@@ -151,12 +162,13 @@ def check_and_configure_gpu():
             
             print(f"TensorFlow version: {tf.__version__}")
             
-            # Configure GPU memory growth
+            # 2. Enable "Memory Growth" for all GPUs
             try:
                 for gpu in gpus:
                     tf.config.experimental.set_memory_growth(gpu, True)
-                print("✓ GPU memory growth enabled")
+                print("✅ GPU Memory Growth Enabled")
             except RuntimeError as e:
+                # Memory growth must be set before GPUs have been initialized
                 print(f"⚠ Warning: Could not set GPU memory growth: {e}")
             
             print("DeepFace should use GPU automatically")
@@ -178,6 +190,41 @@ def check_and_configure_gpu():
         print("="*60 + "\n")
         return False
 
+def get_windows_host_ip():
+    return "172.29.224.1"
+    """Get the Windows host IP address from WSL2"""
+    try:
+        # In WSL2, the Windows host IP is in /etc/resolv.conf
+        if os.path.exists('/etc/resolv.conf'):
+            with open('/etc/resolv.conf', 'r') as f:
+                for line in f:
+                    if line.startswith('nameserver'):
+                        ip = line.split()[1]
+                        # Skip localhost
+                        if ip != '127.0.0.1':
+                            return ip
+    except Exception as e:
+        print(f"Could not read /etc/resolv.conf: {e}")
+    
+    # Fallback: try common WSL2 host IPs
+    # WSL2 typically uses 172.x.x.1 for Windows host
+    try:
+        # Try to connect to Windows host via common IPs
+        test_ips = ['172.16.0.1', '172.17.0.1', '172.18.0.1', '172.19.0.1', '172.20.0.1']
+        for ip in test_ips:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(0.1)
+                sock.connect((ip, 1995))
+                sock.close()
+                return ip
+            except:
+                continue
+    except:
+        pass
+    
+    return None
+
 def main():
     """Main function to run emotion detection demo"""
     print("Initializing emotion detection demo...")
@@ -185,13 +232,55 @@ def main():
     # Check and configure GPU
     check_and_configure_gpu()
     
-    # Initialize camera
-    camera = CameraInput(DEFAULT_CAMERA_CONFIG)
-    camera._initialize_camera()
+    # Initialize camera from webcam server
+    # Webcam server should be running on port 1995
+    # Try multiple connection methods for WSL2 compatibility
+    webcam_server_urls = []
     
-    if not camera.isOpened():
-        print("Error: Could not open camera")
+    # First try localhost (if running in same environment)
+    webcam_server_urls.append("http://172.29.224.1:1995/video")
+    webcam_server_urls.append("http://localhost:1995/video")
+    
+    # If in WSL2, try Windows host IP
+    windows_host_ip = get_windows_host_ip()
+    if windows_host_ip:
+        webcam_server_urls.append(f"http://{windows_host_ip}:1995/video")
+        print(f"Detected Windows host IP: {windows_host_ip}")
+    
+    camera = None
+    connected_url = None
+    
+    print("Attempting to connect to webcam server...")
+    for url in webcam_server_urls:
+        print(f"  Trying: {url}")
+        camera = cv2.VideoCapture(url)
+        if camera.isOpened():
+            # Try to read a frame to verify connection
+            ret, frame = camera.read()
+            if ret and frame is not None:
+                connected_url = url
+                print(f"✓ Successfully connected to webcam server at {url}")
+                break
+            else:
+                camera.release()
+                camera = None
+    
+    if not camera or not camera.isOpened():
+        print("\n" + "="*60)
+        print("ERROR: Could not connect to webcam server!")
+        print("="*60)
+        print("Tried the following URLs:")
+        for url in webcam_server_urls:
+            print(f"  - {url}")
+        print("\nMake sure:")
+        print("  1. webcam_server.py is running (on Windows or WSL2)")
+        print("  2. The server is accessible from this environment")
+        if windows_host_ip:
+            print(f"  3. If running on Windows, try: http://{windows_host_ip}:1995/video")
+        print("="*60)
         return
+    
+    print(f"Using webcam server: {connected_url}")
     
     # Initialize emotion detector
     print("Loading emotion detection models...")
@@ -211,11 +300,11 @@ def main():
     
     try:
         while True:
-            # Read frame from camera
-            ret, frame = camera.read_flipped()
+            # Read frame from webcam server stream
+            ret, frame = camera.read()
             
             if not ret or frame is None:
-                print("Warning: Could not read frame from camera")
+                print("Warning: Could not read frame from webcam server")
                 time.sleep(0.1)
                 continue
             
@@ -225,8 +314,8 @@ def main():
             # Annotate frame with detection results
             annotated_frame = annotate_frame(frame.copy(), result)
             
-            # Display video feed
-            cv2.imshow('Emotion Detection Demo', annotated_frame)
+           
+           
             
             # Display emotion data to console (throttled)
             current_time = time.time()
@@ -258,7 +347,8 @@ def main():
     finally:
         # Cleanup
         print("\nCleaning up...")
-        camera.release()
+        if camera is not None:
+            camera.release()
         emotion_detector.cleanup()
         cv2.destroyAllWindows()
         print("Demo ended")

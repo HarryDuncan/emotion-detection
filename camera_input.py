@@ -30,19 +30,36 @@ class CameraInput:
 
     def _initialize_camera(self):
         print("Initializing camera")
-        if self.video_capture is None:
-            self.video_capture = cv2.VideoCapture(0)
+        # Release any existing camera connection first to prevent source switching
+        if self.video_capture is not None:
+            self.video_capture.release()
+            self.video_capture = None
+        
+        camera_index = self.input_config.get('camera_index', 0)
+        
+        # Try to open camera with explicit backend to ensure webcam access
+        # On Windows, CAP_DSHOW (DirectShow) is more reliable for webcams and prevents switching to screen capture
+        try:
+            # Try DirectShow backend first (Windows) - this locks to physical webcam devices
+            self.video_capture = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+            if not self.video_capture.isOpened():
+                # Fallback to default backend
+                self.video_capture.release()
+                self.video_capture = cv2.VideoCapture(camera_index)
+        except Exception as e:
+            # Fallback to default if backend selection fails
+            print(f"DirectShow backend failed: {e}, trying default backend")
+            if self.video_capture is not None:
+                try:
+                    self.video_capture.release()
+                except:
+                    pass
+            self.video_capture = cv2.VideoCapture(camera_index)
 
-        if not self.video_capture.isOpened():
-            print("Failed to open video capture.")
+        if self.video_capture is None or not self.video_capture.isOpened():
+            print(f"Failed to open video capture at index {camera_index}.")
             return False
-        
-        # Log actual camera properties for verification
-        actual_fps = self.video_capture.get(cv2.CAP_PROP_FPS)
-        print(f"Camera hardware FPS: {actual_fps}, Target FPS: {self.target_fps}")
-        
-        print("Camera initialized successfully")
-    
+
     def _read_with_frame_rate_limiting(self):
         """Read frames with time-based rate limiting"""
         current_time = time.time()

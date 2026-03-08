@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import cv2
+import numpy as np
 import requests
 import json
 import time
@@ -10,8 +11,13 @@ from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
 app = Flask(__name__)
 CORS(app)
 
-# Initialize camera
-camera_input = CameraInput(DEFAULT_CAMERA_CONFIG)
+# Initialize camera: CAMERA_URL for remote feed (e.g. http://192.168.1.10:5000/video_feed), else CAMERA_INDEX
+_camera_config = {**DEFAULT_CAMERA_CONFIG}
+if os.environ.get('CAMERA_URL'):
+    _camera_config['camera_url'] = os.environ.get('CAMERA_URL').strip()
+if os.environ.get('CAMERA_INDEX') is not None:
+    _camera_config['camera_index'] = int(os.environ.get('CAMERA_INDEX', 0))
+camera_input = CameraInput(_camera_config)
 
 # Initialization status
 initialization_status = {
@@ -48,17 +54,24 @@ def initialize_system():
     """Initialize camera and TensorFlow."""
     global initialization_status
 
-    # Check camera
-    if camera_input.isOpened():
-        ret, frame = camera_input.read_flipped()
-        if ret and frame is not None:
-            print("Camera got frames")
-            initialization_status['camera_ready'] = True
+    # Check camera (non-fatal: no camera is ok in WSL/headless)
+    try:
+        camera_input._initialize_camera()
+        if camera_input.isOpened():
+            source = _camera_config.get('camera_url') or f"device index {_camera_config.get('camera_index', 0)}"
+            print(f"Camera source: {source}")
+            ret, frame = camera_input.read_flipped()
+            if ret and frame is not None:
+                print(f"Camera reading frames OK (shape {frame.shape})")
+                initialization_status['camera_ready'] = True
+            else:
+                print("Camera opened but cannot read frames")
+                initialization_status['camera_ready'] = False
         else:
-            print("Camera opened but cannot read frames")
+            print("No camera at index (app will run without video feed).")
             initialization_status['camera_ready'] = False
-    else:
-        print("Error: Could not open camera")
+    except Exception as e:
+        print(f"Camera init failed: {e}. App will run without video feed.")
         initialization_status['camera_ready'] = False
 
     # Load and check TensorFlow / GPU
@@ -108,58 +121,43 @@ def get_emotions():
         'message': 'Emotion detection disabled in appv2.'
     })
 
+def _no_camera_frame_bytes():
+    """Single JPEG frame with 'No camera' text for headless/WSL."""
+    img = np.zeros((240, 320, 3), dtype=np.uint8)
+    img[:] = (40, 40, 40)
+    cv2.putText(img, "No camera", (70, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (200, 200, 200), 2)
+    _, buf = cv2.imencode('.jpg', img)
+    return buf.tobytes()
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    """Handle chat with Ollama (no emotion context in v2)."""
-    user_message = request.json.get('message', '')
 
-    url = "http://localhost:11434/api/chat"
-    payload = {
-        "model": "machine",
-        "messages": [{"role": "user", "content": user_message}],
-        "stream": True
-    }
-
-    def generate():
-        try:
-            response = requests.post(url, json=payload, stream=True)
-
-            if response.status_code == 200:
-                for line in response.iter_lines(decode_unicode=True):
-                    if line:
-                        try:
-                            json_data = json.loads(line)
-                            if "message" in json_data and "content" in json_data["message"]:
-                                content = json_data["message"]["content"]
-                                yield f"data: {json.dumps({'content': content, 'done': json_data.get('done', False)})}\n\n"
-                        except json.JSONDecodeError:
-                            continue
-            else:
-                yield f"data: {json.dumps({'error': f'Error: {response.status_code}'})}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-    return Response(stream_with_context(generate()), mimetype='text/event-stream')
-
+# Log video_feed frame read every N frames to confirm camera/port input
+VIDEO_FEED_LOG_INTERVAL = 100  # log every N frames
 
 @app.route('/video_feed')
 def video_feed():
     """Video streaming route - plain feed, no emotion overlay."""
     def generate():
+        no_camera_frame = _no_camera_frame_bytes() if not initialization_status.get('camera_ready') else None
+        frame_count = 0
         while True:
+            if not camera_input.isOpened():
+                if no_camera_frame is not None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
+                time.sleep(0.5)
+                continue
             ret, frame = camera_input.read_flipped()
-
             if not ret or frame is None:
                 time.sleep(0.1)
                 continue
-
+            frame_count += 1
+            if frame_count % VIDEO_FEED_LOG_INTERVAL == 1:
+                print(f"[video_feed] reading frames from camera input OK (frame #{frame_count}, shape {frame.shape})")
             ret, buffer = cv2.imencode('.jpg', frame)
             if ret:
                 frame_bytes = buffer.tobytes()
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-
             time.sleep(0.03)  # ~30 FPS
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
@@ -168,7 +166,6 @@ def video_feed():
 if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         print("Starting initialization...")
-        camera_input._initialize_camera()
         initialize_system()
 
         import atexit
@@ -184,4 +181,4 @@ if __name__ == '__main__':
         atexit.register(cleanup)
 
     port = int(os.environ.get('PORT', 5005))
-    app.run(debug=True, threaded=True, port=port)
+    app.run(debug=True, threaded=True, port=port, host='0.0.0.0')

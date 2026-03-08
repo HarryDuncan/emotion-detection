@@ -9,7 +9,10 @@ DEFAULT_CAMERA_CONFIG = {
     'camera_fps_min': 15,
     'camera_fps_max': 60,
     'camera_index': 0,
-    'camera_flip_horizontal': True,  
+    # Use a URL to read from a remote video feed (e.g. Windows machine serving /video_feed)
+    # Example: "http://192.168.1.10:5000/video_feed" — if set, overrides camera_index
+    'camera_url': None,
+    'camera_flip_horizontal': True,
 }
 
 class CameraInput:
@@ -31,24 +34,48 @@ class CameraInput:
     def _initialize_camera(self):
         print("Initializing camera")
         if self.video_capture is not None:
-            self.video_capture.release()
+            try:
+                self.video_capture.release()
+            except Exception:
+                pass
+            self.video_capture = None
+
+        camera_url = self.input_config.get('camera_url')
+        camera_index = self.input_config.get('camera_index', 0)
+
+        if camera_url:
+            # Read from remote video feed (e.g. http://192.168.1.10:5000/video_feed)
+            source = camera_url
+            print(f"Opening video feed from URL: {camera_url}")
         else:
-            self.video_capture = cv2.VideoCapture(0)
+            source = camera_index
+            print(f"Opening camera device index: {camera_index}")
+
+        try:
+            self.video_capture = cv2.VideoCapture(source)
+        except Exception as e:
+            print(f"Could not open video source {source!r}: {e}")
+            return False
 
         if not self.video_capture.isOpened():
-            print("Failed to open video capture.")
+            print("Failed to open video capture (source: {}).".format(source))
+            self.video_capture.release()
+            self.video_capture = None
             return False
-        
-        # Log actual camera properties for verification
+
+        # Log properties (FPS may be 0 or unreliable for stream URLs)
         actual_fps = self.video_capture.get(cv2.CAP_PROP_FPS)
-        print(f"Camera hardware FPS: {actual_fps}, Target FPS: {self.target_fps}")
-        
+        print(f"Video source opened. FPS: {actual_fps}, Target FPS: {self.target_fps}")
+
         print("Camera initialized successfully")
+        return True
     
     def _read_with_frame_rate_limiting(self):
         """Read frames with time-based rate limiting"""
+        if self.video_capture is None:
+            return False, None
         current_time = time.time()
-        
+
         # Check if enough time has passed since last frame
         if current_time - self.last_frame_time >= self.frame_interval:
             # Time to read a new frame
@@ -82,13 +109,17 @@ class CameraInput:
                 return ret, frame
     
     def get_frame_width(self):
+        if self.video_capture is None:
+            return 0
         return int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-    
+
     def get_frame_height(self):
+        if self.video_capture is None:
+            return 0
         return int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     def isOpened(self):
-        return self.video_capture.isOpened()
+        return self.video_capture is not None and self.video_capture.isOpened()
     
     def read(self):
         """Read a frame with frame rate limiting"""
@@ -102,7 +133,12 @@ class CameraInput:
         return ret, frame
     
     def release(self):
-        self.video_capture.release()
+        if self.video_capture is not None:
+            try:
+                self.video_capture.release()
+            except Exception:
+                pass
+            self.video_capture = None
     
     def get_video_capture(self):
         return self.video_capture

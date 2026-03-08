@@ -11,12 +11,18 @@ from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
 app = Flask(__name__)
 CORS(app)
 
-# Initialize camera: CAMERA_URL for remote feed (e.g. http://192.168.1.10:5000/video_feed), else CAMERA_INDEX
+# Initialize camera: CAMERA_URL for remote feed; default to Windows interaction_node stream.
+# From WSL, if localhost fails to reach Windows, set CAMERA_URL=http://<Windows_IP>:5000/interaction_node/video_feed
+_default_stream_url = "http://172.29.224.1:5000/interaction_node/video_feed"
 _camera_config = {**DEFAULT_CAMERA_CONFIG}
-if os.environ.get('CAMERA_URL'):
-    _camera_config['camera_url'] = os.environ.get('CAMERA_URL').strip()
-if os.environ.get('CAMERA_INDEX') is not None:
-    _camera_config['camera_index'] = int(os.environ.get('CAMERA_INDEX', 0))
+_env_url = os.environ.get("CAMERA_URL")
+if _env_url is not None:
+    # Explicit: use this URL, or None if set to "" (use local device)
+    _camera_config["camera_url"] = _env_url.strip() or None
+else:
+    _camera_config["camera_url"] = os.environ.get("CAMERA_STREAM_URL", _default_stream_url)
+if os.environ.get("CAMERA_INDEX") is not None:
+    _camera_config["camera_index"] = int(os.environ.get("CAMERA_INDEX", 0))
 camera_input = CameraInput(_camera_config)
 
 # Initialization status

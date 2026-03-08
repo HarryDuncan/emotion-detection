@@ -7,9 +7,21 @@ import json
 import time
 import os
 from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
+from emotion_detection.emotion_detector import EmotionDetector
+
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
+# --- NEW: Enable massive CUDA caching ---
+os.environ["CUDA_CACHE_DISABLE"] = "0"
+# Set cache size to 2GB so it has plenty of room to store the 5080 binaries
+os.environ["CUDA_CACHE_MAXSIZE"] = "2147483648"
 
 app = Flask(__name__)
 CORS(app)
+cache_dir = os.path.expanduser("~/.nv/ComputeCache")
+os.environ["CUDA_CACHE_PATH"] = cache_dir
+# Emotion detector for /video_dominant_emotion (models loaded on startup)
+emotion_detector = EmotionDetector()
 
 # Initialize camera: CAMERA_URL for remote feed; default to Windows interaction_node stream.
 # From WSL, if localhost fails to reach Windows, set CAMERA_URL=http://<Windows_IP>:5000/interaction_node/video_feed
@@ -31,30 +43,62 @@ initialization_status = {
     'tensorflow_ready': False,
     'tensorflow_gpu': False,
     'tensorflow_gpu_devices': [],
+    'emotion_models_loaded': False,
     'initializing': True
 }
 
+def log_cuda_cache_status():
+    """Logs the existence and size of the CUDA cache to verify JIT progress."""
+    if os.path.exists(cache_dir):
+        # Calculate the total size of the cache directory
+        size_bytes = sum(os.path.getsize(os.path.join(dirpath, filename)) 
+                         for dirpath, _, filenames in os.walk(cache_dir) 
+                         for filename in filenames)
+        size_mb = size_bytes / (1024 * 1024)
+        print(f"ℹ️ CUDA Cache Status: Found at {cache_dir}")
+        print(f"ℹ️ CUDA Cache Size: {size_mb:.2f} MB")
+        
+        if size_mb > 50:
+            print("✅ Cache looks populated. TensorFlow should load quickly!")
+        else:
+            print("⏳ Cache is small. JIT compilation might still be running or hasn't started.")
+    else:
+        print("⚠️ No CUDA Cache found. The RTX 5080 will need to JIT compile the models (this may take 30+ minutes).")
+log_cuda_cache_status()
 
 def check_tensorflow_gpu():
-    """Load TensorFlow and verify it sees GPU(s)."""
+    """Load TensorFlow, enable memory growth, and verify it sees GPU(s)."""
     try:
         import tensorflow as tf
         gpus = tf.config.list_physical_devices('GPU')
+        
+        # --- NEW: Enable Memory Growth ---
+        if gpus:
+            try:
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print("✅ Successfully enabled TensorFlow GPU memory growth.")
+            except RuntimeError as e:
+                # Memory growth must be set before GPUs have been initialized
+                print(f"⚠️ Warning: Could not set memory growth: {e}")
+        # ---------------------------------
+
         initialization_status['tensorflow_ready'] = True
         initialization_status['tensorflow_gpu'] = len(gpus) > 0
         initialization_status['tensorflow_gpu_devices'] = [g.name for g in gpus]
+        
         if gpus:
             print(f"TensorFlow GPU available: {[g.name for g in gpus]}")
         else:
             print("TensorFlow running on CPU (no GPU devices found)")
         return True
+    
     except Exception as e:
         print(f"TensorFlow check failed: {e}")
         initialization_status['tensorflow_ready'] = False
         initialization_status['tensorflow_gpu'] = False
         initialization_status['tensorflow_gpu_devices'] = []
         return False
-
 
 def initialize_system():
     """Initialize camera and TensorFlow."""
@@ -82,6 +126,14 @@ def initialize_system():
 
     # Load and check TensorFlow / GPU
     check_tensorflow_gpu()
+
+    # Load emotion models for /video_dominant_emotion
+    try:
+        emotion_detector.load_models()
+        initialization_status['emotion_models_loaded'] = emotion_detector.models_loaded
+    except Exception as e:
+        print(f"Emotion models not loaded: {e}")
+        initialization_status['emotion_models_loaded'] = False
 
     initialization_status['initializing'] = False
     print("Initialization complete")
@@ -169,6 +221,38 @@ def video_feed():
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+@app.route('/video_dominant_emotion')
+def video_dominant_emotion():
+    """Video stream with a colored rectangle around the face based on dominant emotion."""
+    def generate():
+        no_camera_frame = _no_camera_frame_bytes() if not initialization_status.get('camera_ready') else None
+        while True:
+            if not camera_input.isOpened():
+                if no_camera_frame is not None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
+                time.sleep(0.5)
+                continue
+            ret, frame = camera_input.read_flipped()
+            if not ret or frame is None:
+                time.sleep(0.1)
+                continue
+            if initialization_status.get('emotion_models_loaded'):
+                result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+                if result and result.get('face_detected'):
+                    x, y, w, h = result['face_bbox']
+                    color = result['emotion_color_bgr']
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if ret:
+                frame_bytes = buffer.tobytes()
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.03)
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
 if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         print("Starting initialization...")
@@ -180,6 +264,10 @@ if __name__ == '__main__':
             print("Cleaning up...")
             try:
                 camera_input.release()
+            except Exception:
+                pass
+            try:
+                emotion_detector.cleanup()
             except Exception:
                 pass
             print("Cleanup complete")

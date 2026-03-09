@@ -1,0 +1,37 @@
+services:
+  emotion-app:
+    build: .
+    image: emotion-app-gpu:latest
+    container_name: emotion-app
+    # Use host networking to bypass the virtual bridge for UDP performance
+    network_mode: host
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    healthcheck:
+      test: ["CMD", "python3", "gpu_check.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    # Note: 'ports' are ignored when using network_mode: host
+    volumes:
+      - .:/workspace
+      - ./.nv_cache:/root/.nv
+    environment:
+      - CUDA_CACHE_PATH=/root/.nv/ComputeCache
+      - TF_CPP_MIN_LOG_LEVEL=3
+      - GLOG_minloglevel=2
+      - TF_ENABLE_ONEDNN_OPTS=0
+      - PORT=5005
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    stdin_open: true
+    tty: true
+    restart: unless-stopped

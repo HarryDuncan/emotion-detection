@@ -30,22 +30,24 @@ class EmotionDetector:
         """Pre-load DeepFace models"""
         print("Loading emotion detection models...")
         try:
-            # Create a test frame to trigger model loading
-            # Models are lazy-loaded, so we need to actually call analyze
-            test_frame = np.ones((224, 224, 3), dtype=np.uint8) * 128  # Gray frame
+            # 224x224 RGB image matches the model's expected input size exactly
+            test_frame = np.ones((224, 224, 3), dtype=np.uint8) * 128
             try:
-                # This will trigger model download/loading on first run
-                # It will fail (no face), but models will be cached
-                DeepFace.analyze(test_frame, actions=['emotion'], enforce_detection=False, silent=True)
+                # detector_backend='skip' tells DeepFace the image is already a
+                # cropped face — avoids an extra face detection pass during warmup
+                DeepFace.analyze(
+                    test_frame,
+                    actions=['emotion'],
+                    enforce_detection=False,
+                    silent=True,
+                )
             except Exception as e:
-                # Expected to fail (no face detected), but models are now loaded
                 print(f"Model loading triggered (expected error: {type(e).__name__})")
             self.models_loaded = True
             print("Models loaded successfully")
             return True
         except Exception as e:
             print(f"Error loading models: {e}")
-            # Still mark as loaded if it's just a detection error
             if "No face" in str(e) or "face" in str(e).lower():
                 self.models_loaded = True
                 return True
@@ -71,15 +73,16 @@ class EmotionDetector:
             Returns None if no face detected or error occurred.
         """
         try:
-            # Convert frame to grayscale for face detection
+            # Grayscale used only for fast Haar cascade face detection
             gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Convert grayscale frame to RGB format for DeepFace
-            rgb_frame = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2RGB)
-            
+
+            # Convert the original BGR frame to RGB for DeepFace (not the gray frame —
+            # DeepFace needs colour to produce accurate emotion scores)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
             # Detect faces in the frame
             faces = self.face_cascade.detectMultiScale(gray_frame, scaleFactor=1.05, minNeighbors=7, minSize=(50, 50))
-            
+
             if len(faces) == 0:
                 return {
                     'emotions': {},
@@ -89,15 +92,24 @@ class EmotionDetector:
                     'face_detected': False,
                     'face_bbox': None
                 }
-            
+
             # Use the first detected face
             (x, y, w, h) = faces[0]
-            
-            # Extract the face ROI (Region of Interest)
+
+            # Crop the face ROI and resize to 224x224 — the model's native input size.
+            # Resizing here avoids scaling inside TensorFlow and reduces GPU work.
             face_roi = rgb_frame[y:y + h, x:x + w]
-            
-            # Perform emotion analysis on the face ROI
-            result = DeepFace.analyze(face_roi, actions=['emotion'], enforce_detection=False, silent=silent)
+            face_roi = cv2.resize(face_roi, (224, 224))
+
+            # detector_backend='skip' tells DeepFace the image is already a cropped
+            # face, so it skips its own (expensive) face detection pass entirely.
+            result = DeepFace.analyze(
+                face_roi,
+                actions=['emotion'],
+                enforce_detection=False,
+                detector_backend='skip',
+                silent=silent,
+            )
             
             # Get all emotions from the result
             emotions = result[0]['emotion']

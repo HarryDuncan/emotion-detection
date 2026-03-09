@@ -1,3 +1,15 @@
+import os
+
+# Suppress TensorFlow and ABSL logs before any import that touches TF.
+# TF_CPP_MIN_LOG_LEVEL: 0=all, 1=no INFO, 2=no WARNING, 3=no ERROR (only FATAL)
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+# GLOG_minloglevel suppresses the W0000/I0000 ABSL-format lines (gpu_timer spam etc.)
+# 0=INFO 1=WARNING 2=ERROR 3=FATAL
+os.environ.setdefault("GLOG_minloglevel", "2")
+# Suppress oneDNN and other misc TF noise
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
+os.environ["CUDA_CACHE_MAXSIZE"] = "2147483648"
+
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 import cv2
@@ -5,34 +17,94 @@ import numpy as np
 import requests
 import json
 import time
-import os
+import threading
+import signal
 from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
 from emotion_detection.emotion_detector import EmotionDetector
-
-os.environ["TF_USE_LEGACY_KERAS"] = "1"
-
-# --- NEW: Enable massive CUDA caching ---
-os.environ["CUDA_CACHE_DISABLE"] = "0"
-# Set cache size to 2GB so it has plenty of room to store the 5080 binaries
-os.environ["CUDA_CACHE_MAXSIZE"] = "2147483648"
+from gpu_check import verify_gpu
 
 app = Flask(__name__)
 CORS(app)
-cache_dir = os.path.expanduser("~/.nv/ComputeCache")
-os.environ["CUDA_CACHE_PATH"] = cache_dir
-# Emotion detector for /video_dominant_emotion (models loaded on startup)
-emotion_detector = EmotionDetector()
+
+# Models are pre-loaded at startup so the first real frame is not slow
+emotion_detector = EmotionDetector(load_models_on_init=True)
+
+# ---------------------------------------------------------------------------
+# Stop event — set on shutdown/reload so all background threads exit cleanly.
+# Flask's reloader sends SIGTERM to the child process; we catch it here.
+# ---------------------------------------------------------------------------
+_stop_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# Shared latest frame — written by _camera_reader_loop, read by all routes.
+# This ensures only ONE thread ever calls camera_input.read(), eliminating
+# the concurrent VideoCapture access that causes 'fctx->async_lock' crashes.
+# ---------------------------------------------------------------------------
+_latest_frame = None
+_latest_frame_flipped = None
+_frame_lock = threading.Lock()
+
+_frame_timestamp = 0.0  # time.time() when _latest_frame was last written
+
+def _camera_reader_loop():
+    """Single thread that owns all camera reads. Exits when _stop_event is set."""
+    global _latest_frame, _latest_frame_flipped, _frame_timestamp
+    print("[camera] Reader thread started (drain mode — no sleep)")
+    read_count = 0
+    log_interval = 60  # print stats every N frames
+    while not _stop_event.is_set():
+        if not camera_input.isOpened():
+            time.sleep(0.1)
+            continue
+        t_before = time.time()
+        ret, frame = camera_input.read_latest()
+        t_read = time.time()
+        if ret and frame is not None:
+            flipped = cv2.flip(frame, 1)
+            with _frame_lock:
+                _latest_frame = frame
+                _latest_frame_flipped = flipped
+                _frame_timestamp = t_read
+            read_count += 1
+            if read_count % log_interval == 0:
+                read_ms = (t_read - t_before) * 1000
+                print(f"[camera] frame #{read_count}  read={read_ms:.1f}ms")
+    with _frame_lock:
+        _latest_frame = None
+        _latest_frame_flipped = None
+    print("[camera] Reader thread stopped")
+
+# ---------------------------------------------------------------------------
+# Background inference thread
+# Runs emotion detection at up to EMOTION_FPS independently of the stream FPS.
+# Reads from the shared frame cache — never calls camera_input directly.
+# ---------------------------------------------------------------------------
+EMOTION_FPS = 10
+_latest_emotion_result = {'face_detected': False}
+_emotion_result_lock = threading.Lock()
+
+def _emotion_inference_loop():
+    """Runs emotion inference. Exits when _stop_event is set."""
+    interval = 1.0 / EMOTION_FPS
+    print("[emotion] Inference thread started")
+    while not _stop_event.is_set():
+        if initialization_status.get('emotion_models_loaded'):
+            with _frame_lock:
+                frame = _latest_frame_flipped
+            if frame is not None:
+                result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+                with _emotion_result_lock:
+                    _latest_emotion_result.clear()
+                    _latest_emotion_result.update(result)
+        time.sleep(interval)
+    print("[emotion] Inference thread stopped")
 
 # Initialize camera: CAMERA_URL for remote feed; default to Windows interaction_node stream.
 # From WSL, if localhost fails to reach Windows, set CAMERA_URL=http://<Windows_IP>:5000/interaction_node/video_feed
-_default_stream_url = "http://172.29.224.1:5000/interaction_node/video_feed"
+_default_stream_url = "udp://@0.0.0.0:1235"
 _camera_config = {**DEFAULT_CAMERA_CONFIG}
-_env_url = os.environ.get("CAMERA_URL")
-if _env_url is not None:
-    # Explicit: use this URL, or None if set to "" (use local device)
-    _camera_config["camera_url"] = _env_url.strip() or None
-else:
-    _camera_config["camera_url"] = os.environ.get("CAMERA_STREAM_URL", _default_stream_url)
+_env_url = _default_stream_url
+_camera_config["camera_url"] = _env_url
 if os.environ.get("CAMERA_INDEX") is not None:
     _camera_config["camera_index"] = int(os.environ.get("CAMERA_INDEX", 0))
 camera_input = CameraInput(_camera_config)
@@ -47,24 +119,6 @@ initialization_status = {
     'initializing': True
 }
 
-def log_cuda_cache_status():
-    """Logs the existence and size of the CUDA cache to verify JIT progress."""
-    if os.path.exists(cache_dir):
-        # Calculate the total size of the cache directory
-        size_bytes = sum(os.path.getsize(os.path.join(dirpath, filename)) 
-                         for dirpath, _, filenames in os.walk(cache_dir) 
-                         for filename in filenames)
-        size_mb = size_bytes / (1024 * 1024)
-        print(f"ℹ️ CUDA Cache Status: Found at {cache_dir}")
-        print(f"ℹ️ CUDA Cache Size: {size_mb:.2f} MB")
-        
-        if size_mb > 50:
-            print("✅ Cache looks populated. TensorFlow should load quickly!")
-        else:
-            print("⏳ Cache is small. JIT compilation might still be running or hasn't started.")
-    else:
-        print("⚠️ No CUDA Cache found. The RTX 5080 will need to JIT compile the models (this may take 30+ minutes).")
-log_cuda_cache_status()
 
 def check_tensorflow_gpu():
     """Load TensorFlow, enable memory growth, and verify it sees GPU(s)."""
@@ -101,8 +155,11 @@ def check_tensorflow_gpu():
         return False
 
 def initialize_system():
-    """Initialize camera and TensorFlow."""
+    """Initialize camera and TensorFlow. Safe to call on each Flask reload."""
     global initialization_status
+
+    # Reset the stop flag so threads start fresh on every reload
+    _stop_event.clear()
 
     # Check camera (non-fatal: no camera is ok in WSL/headless)
     try:
@@ -110,15 +167,9 @@ def initialize_system():
         if camera_input.isOpened():
             source = _camera_config.get('camera_url') or f"device index {_camera_config.get('camera_index', 0)}"
             print(f"Camera source: {source}")
-            ret, frame = camera_input.read_flipped()
-            if ret and frame is not None:
-                print(f"Camera reading frames OK (shape {frame.shape})")
-                initialization_status['camera_ready'] = True
-            else:
-                print("Camera opened but cannot read frames")
-                initialization_status['camera_ready'] = False
+            initialization_status['camera_ready'] = True
         else:
-            print("No camera at index (app will run without video feed).")
+            print("No camera source available (app will run without video feed).")
             initialization_status['camera_ready'] = False
     except Exception as e:
         print(f"Camera init failed: {e}. App will run without video feed.")
@@ -136,6 +187,13 @@ def initialize_system():
         initialization_status['emotion_models_loaded'] = False
 
     initialization_status['initializing'] = False
+
+    # Single camera reader — the only thread that calls camera_input.read()
+    threading.Thread(target=_camera_reader_loop, daemon=True, name="camera-reader").start()
+
+    # Emotion inference reads from the shared frame cache, never from camera directly
+    threading.Thread(target=_emotion_inference_loop, daemon=True, name="emotion-inference").start()
+
     print("Initialization complete")
     return True
 
@@ -188,91 +246,114 @@ def _no_camera_frame_bytes():
     return buf.tobytes()
 
 
-# Log video_feed frame read every N frames to confirm camera/port input
-VIDEO_FEED_LOG_INTERVAL = 100  # log every N frames
+# Lower quality = faster encode + less data over WSL2 network bridge = less lag.
+# 70 is visually fine for live preview; raise to 90 if quality matters more than latency.
+STREAM_JPEG_QUALITY = int(os.environ.get("STREAM_JPEG_QUALITY", 70))
+_jpeg_params = [cv2.IMWRITE_JPEG_QUALITY, STREAM_JPEG_QUALITY]
+
+VIDEO_FEED_LOG_INTERVAL = 30  # log every N frames (~1s at 30fps)
 
 @app.route('/video_feed')
 def video_feed():
     """Video streaming route - plain feed, no emotion overlay."""
+    no_camera_frame = _no_camera_frame_bytes()
     def generate():
-        no_camera_frame = _no_camera_frame_bytes() if not initialization_status.get('camera_ready') else None
         frame_count = 0
         while True:
-            if not camera_input.isOpened():
-                if no_camera_frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
+            t0 = time.time()
+            with _frame_lock:
+                frame = _latest_frame_flipped
+                frame_age = t0 - _frame_timestamp if _frame_timestamp else 0
+            if frame is None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
                 time.sleep(0.5)
                 continue
-            ret, frame = camera_input.read_flipped()
-            if not ret or frame is None:
-                time.sleep(0.1)
-                continue
-            frame_count += 1
-            if frame_count % VIDEO_FEED_LOG_INTERVAL == 1:
-                print(f"[video_feed] reading frames from camera input OK (frame #{frame_count}, shape {frame.shape})")
-            ret, buffer = cv2.imencode('.jpg', frame)
+            t1 = time.time()
+            ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
+            t2 = time.time()
             if ret:
-                frame_bytes = buffer.tobytes()
                 yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.03)  # ~30 FPS
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            t3 = time.time()
+            frame_count += 1
+            if frame_count % VIDEO_FEED_LOG_INTERVAL == 0:
+                print(
+                    f"[video_feed] #{frame_count}"
+                    f"  frame_age={frame_age*1000:.0f}ms"   # how old was the frame when we grabbed it
+                    f"  lock={((t1-t0)*1000):.1f}ms"        # time to acquire _frame_lock
+                    f"  encode={((t2-t1)*1000):.1f}ms"      # JPEG encode time
+                    f"  yield={((t3-t2)*1000):.1f}ms"       # time to hand frame to Flask/network
+                )
+            time.sleep(0.033)
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 @app.route('/video_dominant_emotion')
 def video_dominant_emotion():
-    """Video stream with a colored rectangle around the face based on dominant emotion."""
+    """Video stream at full FPS with emotion overlay drawn from the background inference thread."""
     def generate():
-        no_camera_frame = _no_camera_frame_bytes() if not initialization_status.get('camera_ready') else None
+        no_camera_frame = _no_camera_frame_bytes()
         while True:
-            if not camera_input.isOpened():
-                if no_camera_frame is not None:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
+            with _frame_lock:
+                frame = _latest_frame_flipped
+            if frame is None:
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
                 time.sleep(0.5)
                 continue
-            ret, frame = camera_input.read_flipped()
-            if not ret or frame is None:
-                time.sleep(0.1)
-                continue
-            if initialization_status.get('emotion_models_loaded'):
-                result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
-                if result and result.get('face_detected'):
-                    x, y, w, h = result['face_bbox']
-                    color = result['emotion_color_bgr']
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-            ret, buffer = cv2.imencode('.jpg', frame)
+
+            # Copy so we can draw on it without affecting the shared reference
+            frame = frame.copy()
+
+            with _emotion_result_lock:
+                result = dict(_latest_emotion_result)
+
+            if result.get('face_detected'):
+                x, y, w, h = result['face_bbox']
+                color = result['emotion_color_bgr']
+                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+
+            ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
             if ret:
-                frame_bytes = buffer.tobytes()
                 yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            time.sleep(0.03)
+                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.01)  # ~30 FPS cap on the output side
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+def _shutdown(signum=None, frame=None):
+    """Signal the background threads to stop and release the camera.
+    Called on SIGTERM (Flask reloader kills the child with SIGTERM) and atexit.
+    """
+    print(f"[shutdown] Stopping background threads (signal={signum})...")
+    _stop_event.set()
+    # Give threads a moment to notice the stop flag before releasing the capture
+    time.sleep(0.15)
+    try:
+        camera_input.release()
+    except Exception:
+        pass
+    try:
+        emotion_detector.cleanup()
+    except Exception:
+        pass
+    print("[shutdown] Cleanup complete")
+
+
 if __name__ == '__main__':
     if os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
+        # This branch runs in the reloader child process.
+        # Register cleanup for both graceful shutdown (atexit) and
+        # SIGTERM (sent by Flask reloader when it kills the old child on reload).
+        import atexit
+        atexit.register(_shutdown)
+        signal.signal(signal.SIGTERM, _shutdown)
+
         print("Starting initialization...")
         initialize_system()
-
-        import atexit
-
-        def cleanup():
-            print("Cleaning up...")
-            try:
-                camera_input.release()
-            except Exception:
-                pass
-            try:
-                emotion_detector.cleanup()
-            except Exception:
-                pass
-            print("Cleanup complete")
-
-        atexit.register(cleanup)
 
     port = int(os.environ.get('PORT', 5005))
     app.run(debug=True, threaded=True, port=port, host='0.0.0.0')

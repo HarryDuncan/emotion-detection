@@ -14,7 +14,6 @@ from flask import Flask, render_template, request, jsonify, Response, stream_wit
 from flask_cors import CORS
 import cv2
 import numpy as np
-import requests
 import json
 import time
 import threading
@@ -99,14 +98,11 @@ def _emotion_inference_loop():
         time.sleep(interval)
     print("[emotion] Inference thread stopped")
 
-# Initialize camera: CAMERA_URL for remote feed; default to Windows interaction_node stream.
-# From WSL, if localhost fails to reach Windows, set CAMERA_URL=http://<Windows_IP>:5000/interaction_node/video_feed
-_default_stream_url = "udp://@0.0.0.0:1235"
+# Initialize camera: use local cv2 device index 0 by default.
+# Override with CAMERA_INDEX env var if needed.
 _camera_config = {**DEFAULT_CAMERA_CONFIG}
-_env_url = _default_stream_url
-_camera_config["camera_url"] = _env_url
-if os.environ.get("CAMERA_INDEX") is not None:
-    _camera_config["camera_index"] = int(os.environ.get("CAMERA_INDEX", 0))
+_camera_config["camera_url"] = None
+_camera_config["camera_index"] = int(os.environ.get("CAMERA_INDEX", 0))
 camera_input = CameraInput(_camera_config)
 
 # Initialization status
@@ -165,8 +161,7 @@ def initialize_system():
     try:
         camera_input._initialize_camera()
         if camera_input.isOpened():
-            source = _camera_config.get('camera_url') or f"device index {_camera_config.get('camera_index', 0)}"
-            print(f"Camera source: {source}")
+            print(f"Camera source: device index {_camera_config.get('camera_index', 0)}")
             initialization_status['camera_ready'] = True
         else:
             print("No camera source available (app will run without video feed).")

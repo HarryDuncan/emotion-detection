@@ -4,14 +4,15 @@ FROM nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 # 2. Prevent interactive prompts during apt-get
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 3. Install system dependencies for OpenCV and general image processing
-# libgl1 and libglib2.0-0 are required for cv2 to function in Linux
+# 3. Install system dependencies for OpenCV and Video4Linux
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
+    v4l-utils \
+    libv4l-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Set the working directory inside the container

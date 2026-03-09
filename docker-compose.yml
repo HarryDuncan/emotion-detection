@@ -1,6 +1,9 @@
 services:
   emotion-app:
     build: .
+    privileged: true  # Necessary for hardware access
+    devices:
+      - "/dev/video0:/dev/video0"
     image: emotion-app-gpu:latest
     container_name: emotion-app
     # Use host networking to bypass the virtual bridge for UDP performance
@@ -9,13 +12,6 @@ services:
     ulimits:
       memlock: -1
       stack: 67108864
-    healthcheck:
-      test: ["CMD", "python3", "gpu_check.py"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
-    # Note: 'ports' are ignored when using network_mode: host
     volumes:
       - .:/workspace
       - ./.nv_cache:/root/.nv

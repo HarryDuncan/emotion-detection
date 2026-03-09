@@ -107,7 +107,6 @@ class EmotionDetector:
                 face_roi,
                 actions=['emotion'],
                 enforce_detection=False,
-                detector_backend='skip',
                 silent=silent,
             )
             

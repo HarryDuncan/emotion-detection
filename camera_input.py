@@ -95,8 +95,10 @@ class CameraInput:
                 self.video_capture = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
                 self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             else:
-                self.video_capture = cv2.VideoCapture(source)
+                self.video_capture = cv2.VideoCapture(source, cv2.CAP_V4L2)
                 self.video_capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.video_capture.set(cv2.CAP_PROP_FRAME_WIDTH, 440)
+                self.video_capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 380)
         except Exception as e:
             print(f"Could not open video source {source!r}: {e}")
             return False

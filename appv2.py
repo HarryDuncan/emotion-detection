@@ -9,6 +9,10 @@ os.environ.setdefault("GLOG_minloglevel", "2")
 # Suppress oneDNN and other misc TF noise
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ["CUDA_CACHE_MAXSIZE"] = "2147483648"
+# Silence OpenCV's libjpeg warnings ("Corrupt JPEG data: extraneous bytes…")
+# that fire on every MJPG frame received over USBIPD. The frames are still
+# decoded successfully; the messages are purely noise.
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 from flask import Flask, render_template, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
@@ -36,21 +40,26 @@ _stop_event = threading.Event()
 
 # ---------------------------------------------------------------------------
 # Shared latest frame — written by _camera_reader_loop, read by all routes.
-# This ensures only ONE thread ever calls camera_input.read(), eliminating
-# the concurrent VideoCapture access that causes 'fctx->async_lock' crashes.
+#
+# _frame_condition acts as both the mutex and the signal: the camera reader
+# acquires it, updates the frame, increments _frame_seq, then calls
+# notify_all().  Streaming generators wait with wait_for() keyed on the
+# sequence number, so they wake *exactly* when a new frame arrives — no
+# polling, no fixed sleep().
 # ---------------------------------------------------------------------------
+_frame_condition = threading.Condition()
 _latest_frame = None
 _latest_frame_flipped = None
-_frame_lock = threading.Lock()
+_frame_timestamp = 0.0
+_frame_seq = 0  # monotonically incrementing; generators track their last-seen value
 
-_frame_timestamp = 0.0  # time.time() when _latest_frame was last written
 
 def _camera_reader_loop():
     """Single thread that owns all camera reads. Exits when _stop_event is set."""
-    global _latest_frame, _latest_frame_flipped, _frame_timestamp
-    print("[camera] Reader thread started (drain mode — no sleep)")
+    global _latest_frame, _latest_frame_flipped, _frame_timestamp, _frame_seq
+    print("[camera] Reader thread started")
     read_count = 0
-    log_interval = 60  # print stats every N frames
+    log_interval = 60
     while not _stop_event.is_set():
         if not camera_input.isOpened():
             time.sleep(0.1)
@@ -60,17 +69,20 @@ def _camera_reader_loop():
         t_read = time.time()
         if ret and frame is not None:
             flipped = cv2.flip(frame, 1)
-            with _frame_lock:
+            with _frame_condition:
                 _latest_frame = frame
                 _latest_frame_flipped = flipped
                 _frame_timestamp = t_read
+                _frame_seq += 1
+                _frame_condition.notify_all()
             read_count += 1
             if read_count % log_interval == 0:
                 read_ms = (t_read - t_before) * 1000
                 print(f"[camera] frame #{read_count}  read={read_ms:.1f}ms")
-    with _frame_lock:
+    with _frame_condition:
         _latest_frame = None
         _latest_frame_flipped = None
+        _frame_condition.notify_all()
     print("[camera] Reader thread stopped")
 
 # ---------------------------------------------------------------------------
@@ -78,18 +90,18 @@ def _camera_reader_loop():
 # Runs emotion detection at up to EMOTION_FPS independently of the stream FPS.
 # Reads from the shared frame cache — never calls camera_input directly.
 # ---------------------------------------------------------------------------
-EMOTION_FPS = 30
+EMOTION_FPS = 8  # RetinaFace inference is slow; 8fps is plenty
 _latest_emotion_result = {'face_detected': False, 'faces': []}
 _emotion_result_lock = threading.Lock()
 
 def _emotion_inference_loop():
-    """Runs emotion inference. Exits when _stop_event is set."""
+    """Runs emotion inference at EMOTION_FPS. Exits when _stop_event is set."""
     interval = 1.0 / EMOTION_FPS
     print("[emotion] Inference thread started")
     _dbg_count = 0
     while not _stop_event.is_set():
         if initialization_status.get('emotion_models_loaded'):
-            with _frame_lock:
+            with _frame_condition:
                 frame = _latest_frame_flipped
             if frame is not None:
                 result = emotion_detector.detect_emotions_from_frame(frame, silent=False)
@@ -106,9 +118,11 @@ def _emotion_inference_loop():
 
 # Initialize camera: use local cv2 device index 0 by default.
 # Override with CAMERA_INDEX env var if needed.
-_camera_config = {**DEFAULT_CAMERA_CONFIG}
-_camera_config["camera_url"] = None
-_camera_config["camera_index"] = int(os.environ.get("CAMERA_INDEX", 0))
+_camera_config = {
+    **DEFAULT_CAMERA_CONFIG,
+    "camera_url": None,
+    "camera_index": int(os.environ.get("CAMERA_INDEX", 0)),
+}
 camera_input = CameraInput(_camera_config)
 
 # Initialization status
@@ -256,57 +270,59 @@ VIDEO_FEED_LOG_INTERVAL = 30  # log every N frames (~1s at 30fps)
 
 @app.route('/video_feed')
 def video_feed():
-    """Video streaming route - plain feed, no emotion overlay."""
+    """Video streaming route — plain feed, no emotion overlay."""
     no_camera_frame = _no_camera_frame_bytes()
+
     def generate():
         frame_count = 0
+        last_seq = -1
         while True:
-            t0 = time.time()
-            with _frame_lock:
+            # Block until the camera reader publishes a frame we haven't seen yet.
+            # timeout=1.0 handles the case where the camera drops a frame or
+            # hasn't opened yet — we wake up, emit the placeholder, and retry.
+            with _frame_condition:
+                _frame_condition.wait_for(lambda: _frame_seq != last_seq, timeout=1.0)
                 frame = _latest_frame_flipped
-                frame_age = t0 - _frame_timestamp if _frame_timestamp else 0
+                last_seq = _frame_seq
+                frame_age = time.time() - _frame_timestamp if _frame_timestamp else 0
+
             if frame is None:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
-                time.sleep(0.5)
                 continue
-            t1 = time.time()
+
+            t_enc = time.time()
             ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
-            t2 = time.time()
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            t3 = time.time()
+
             frame_count += 1
             if frame_count % VIDEO_FEED_LOG_INTERVAL == 0:
-                print(
-                    f"[video_feed] #{frame_count}"
-                    f"  frame_age={frame_age*1000:.0f}ms"   # how old was the frame when we grabbed it
-                    f"  lock={((t1-t0)*1000):.1f}ms"        # time to acquire _frame_lock
-                    f"  encode={((t2-t1)*1000):.1f}ms"      # JPEG encode time
-                    f"  yield={((t3-t2)*1000):.1f}ms"       # time to hand frame to Flask/network
-                )
-            time.sleep(0.033)
+                encode_ms = (time.time() - t_enc) * 1000
+                print(f"[video_feed] #{frame_count}  frame_age={frame_age*1000:.0f}ms  encode={encode_ms:.1f}ms")
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
 @app.route('/video_dominant_emotion')
 def video_dominant_emotion():
-    """Video stream at full FPS with emotion overlay drawn from the background inference thread."""
+    """Video stream at camera FPS with per-frame emotion overlay."""
+    no_camera_frame = _no_camera_frame_bytes()
+
     def generate():
-        no_camera_frame = _no_camera_frame_bytes()
+        last_seq = -1
         while True:
-            with _frame_lock:
-                frame = _latest_frame_flipped
+            with _frame_condition:
+                _frame_condition.wait_for(lambda: _frame_seq != last_seq, timeout=1.0)
+                # Copy inside the lock so the camera thread can't overwrite while we draw
+                frame = _latest_frame_flipped.copy() if _latest_frame_flipped is not None else None
+                last_seq = _frame_seq
+
             if frame is None:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
-                time.sleep(0.5)
                 continue
-
-            # Copy so we can draw on it without affecting the shared reference
-            frame = frame.copy()
 
             with _emotion_result_lock:
                 result = dict(_latest_emotion_result)
@@ -316,7 +332,6 @@ def video_dominant_emotion():
                 color = face['emotion_color_bgr']
                 label = face.get('dominant_emotion', '')
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                # Draw label above the box with a filled background for readability
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
                 ty = max(y - 6, th + 4)
                 cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
@@ -328,7 +343,6 @@ def video_dominant_emotion():
             if ret:
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-            time.sleep(0.01)  # ~30 FPS cap on the output side
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 

@@ -1,117 +1,138 @@
-import cv2
 import os
+import numpy as np
+
+# GStreamer is imported LAZILY inside _initialize_camera() to avoid loading
+# libgobject-2.0 before TensorFlow does.  If gi/Gst are loaded at module
+# import time they initialise GLib's GObject type system, which then conflicts
+# with TensorFlow's bundled GLib when CUDA is brought up → SIGSEGV (exit 139).
+_Gst = None  # populated on first call to _initialize_camera()
 
 
 DEFAULT_CAMERA_CONFIG = {
     'camera_fps': 30,
     'camera_index': 0,
     'camera_url': None,      # If set, overrides camera_index (e.g. "udp://@0.0.0.0:1235")
-    'camera_width': 440,
-    'camera_height': 380,
+    'camera_width': 640,
+    'camera_height': 480,
 }
-
-# ============================================================
-# Windows ffmpeg commands (run on Windows, NOT in the container)
-# ============================================================
-#
-# RECOMMENDED — MJPEG (~33ms/frame, no accumulating lag):
-#   ffmpeg -f dshow -framerate 30 -i video="c922 Pro Stream Webcam" \
-#     -vcodec mjpeg -q:v 5 -f mpegts udp://127.0.0.1:1235
-#
-# H.264 (higher compression but ~60ms/frame reads due to GOP/decoder buffer):
-#   ffmpeg -f dshow -framerate 30 -i video="c922 Pro Stream Webcam" \
-#     -vcodec libx264 -preset ultrafast -tune zerolatency -crf 23 \
-#     -x264-params "keyint=15:min-keyint=15:scenecut=0:repeat_headers=1" \
-#     -f mpegts "udp://127.0.0.1:1235?pkt_size=1316"
-# ============================================================
 
 
 class CameraInput:
     """
-    Thin wrapper around cv2.VideoCapture.
+    Camera capture backed by GStreamer.
 
-    Owned exclusively by the camera-reader thread in appv2.py — only one
-    thread ever calls read_latest(), so no internal locking is needed.
+    The MJPG path:
+        v4l2src → image/jpeg caps → jpegdec → videoconvert → BGR appsink
+
+    This avoids the V4L2 raw-YUYV path that caused 256–448ms reads, and the
+    corrupt-JPEG warnings produced by OpenCV's libjpeg when frames arrived
+    over USBIPD with dropped packets.  GStreamer's jpegdec handles partial
+    JPEG data more gracefully and delivers fully decoded BGR frames directly.
+
+    The appsink is configured for pull mode (emit-signals=false) with a
+    max-buffer queue of 1 and drop=true, so pull-sample() always returns the
+    most recent complete frame and naturally blocks at the camera's FPS.
     """
 
     def __init__(self, input_config=None):
-        self.video_capture = None
+        self._pipeline = None
+        self._sink = None
+        self._opened = False
         self.config = {**DEFAULT_CAMERA_CONFIG, **(input_config or {})}
 
     # ------------------------------------------------------------------
     # Initialisation
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _ensure_gst():
+        """Import and initialise GStreamer on the first call (lazy load)."""
+        global _Gst
+        if _Gst is None:
+            import gi
+            gi.require_version('Gst', '1.0')
+            from gi.repository import Gst as _GstModule
+            _GstModule.init(None)
+            _Gst = _GstModule
+        return _Gst
+
     def _initialize_camera(self):
-        if self.video_capture is not None:
-            try:
-                self.video_capture.release()
-            except Exception:
-                pass
-            self.video_capture = None
+        self._teardown()
+
+        Gst = self._ensure_gst()
 
         camera_url = self.config.get('camera_url')
-        camera_index = self.config.get('camera_index', 0)
-        fps = self.config.get('camera_fps', 30)
-        width = self.config.get('camera_width', 440)
-        height = self.config.get('camera_height', 380)
+        index  = self.config.get('camera_index', 0)
+        fps    = self.config.get('camera_fps', 30)
+        width  = self.config.get('camera_width', 640)
+        height = self.config.get('camera_height', 480)
 
         if camera_url:
-            self._open_url(camera_url)
+            pipeline_str = self._url_pipeline(camera_url)
         else:
-            self._open_device(camera_index, width, height, fps)
+            pipeline_str = self._device_pipeline(index, width, height, fps)
 
-        if not self.isOpened():
-            print("Failed to open video capture.")
+        print(f"[camera] GStreamer pipeline: {pipeline_str}")
+        try:
+            self._pipeline = Gst.parse_launch(pipeline_str)
+            self._sink = self._pipeline.get_by_name('sink')
+
+            change = self._pipeline.set_state(Gst.State.PLAYING)
+            if change == Gst.StateChangeReturn.FAILURE:
+                print("[camera] GStreamer pipeline failed to start")
+                self._teardown()
+                return False
+
+            # Block until the pipeline is actually PLAYING (up to 5 s)
+            _, state, _ = self._pipeline.get_state(timeout=5 * Gst.SECOND)
+            if state != Gst.State.PLAYING:
+                print(f"[camera] GStreamer pipeline stalled in state {state.value_nick}")
+                self._teardown()
+                return False
+
+            self._opened = True
+            print(f"[camera] GStreamer ready: {width}x{height} @ {fps}fps  device=/dev/video{index}")
+            return True
+
+        except Exception as e:
+            print(f"[camera] GStreamer init error: {e}")
+            self._teardown()
             return False
 
-        actual_fps = self.video_capture.get(cv2.CAP_PROP_FPS)
-        fourcc_int = int(self.video_capture.get(cv2.CAP_PROP_FOURCC))
-        fourcc_str = "".join(chr((fourcc_int >> (8 * i)) & 0xFF) for i in range(4))
-        w = int(self.video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(self.video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        print(f"Camera ready: {w}x{h} @ {actual_fps:.0f}fps  codec={fourcc_str!r}")
-        return True
+    # ------------------------------------------------------------------
+    # Pipeline strings
+    # ------------------------------------------------------------------
 
-    def _open_device(self, index, width, height, fps):
-        print(f"Opening camera device index {index}")
-        cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    def _device_pipeline(self, index, width, height, fps):
+        """MJPG from a local V4L2 webcam."""
+        device = f"/dev/video{index}"
+        return (
+            f"v4l2src device={device} ! "
+            f"image/jpeg,width={width},height={height},framerate={fps}/1 ! "
+            f"jpegdec ! "
+            f"videoconvert ! "
+            f"video/x-raw,format=BGR ! "
+            f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+        )
 
-        # MJPG: each frame is an independent JPEG — low USB bandwidth, fast
-        # delivery.  Must be set before width/height/fps or the driver may
-        # silently ignore it and fall back to a raw format.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        # Buffer of 1 keeps us on the most-recent frame and avoids the driver
-        # queue building up latency when the consumer is briefly slower.
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
-
-        if cap.isOpened():
-            self.video_capture = cap
-        else:
-            cap.release()
-
-    def _open_url(self, url):
-        print(f"Opening video feed from URL: {url}")
-        is_udp = url.startswith("udp://")
-        if is_udp:
-            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-                "fflags;nobuffer+flush_packets"
-                "|flags;low_delay"
-                "|probesize;32"
-                "|analyzeduration;0"
-                "|max_delay;0"
-                "|thread_type;slice"
-                "|threads;1"
+    def _url_pipeline(self, url):
+        """UDP MPEG-TS or HTTP MJPEG stream."""
+        if url.startswith("udp://"):
+            port = url.rsplit(":", 1)[-1] if ":" in url else "1235"
+            return (
+                f"udpsrc port={port} ! "
+                f"tsdemux ! h264parse ! avdec_h264 max-threads=1 ! "
+                f"videoconvert ! "
+                f"video/x-raw,format=BGR ! "
+                f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
             )
-        cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        if cap.isOpened():
-            self.video_capture = cap
-        else:
-            cap.release()
+        return (
+            f"souphttpsrc location={url} ! "
+            f"multipartdemux ! jpegdec ! "
+            f"videoconvert ! "
+            f"video/x-raw,format=BGR ! "
+            f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+        )
 
     # ------------------------------------------------------------------
     # Runtime API
@@ -119,30 +140,55 @@ class CameraInput:
 
     def read_latest(self):
         """
-        Read the next frame from the capture device.
+        Block until the next frame arrives, then return it as a BGR numpy array.
 
-        Blocking call — returns when the driver delivers a complete frame.
-        The camera-reader thread in appv2.py is the ONLY caller; no locking
-        is needed here.
-
-        Frames with obvious decode failures (zero-size or empty array) are
-        discarded and reported as ret=False so the caller never publishes a
-        garbled frame to the stream.
+        The appsink's max-buffers=1 / drop=true configuration means:
+        - If the consumer (camera-reader thread) is briefly slow, old frames
+          are discarded and this call returns the most recent one.
+        - The call blocks naturally at the camera's capture FPS — no
+          time.sleep() needed in the caller.
         """
-        if self.video_capture is None:
+        if not self._opened or self._sink is None:
             return False, None
-        ret, frame = self.video_capture.read()
-        if not ret or frame is None or frame.size == 0:
+
+        sample = self._sink.emit('pull-sample')
+        if sample is None:
+            return False, None
+
+        buf  = sample.get_buffer()
+        caps = sample.get_caps()
+        s    = caps.get_structure(0)
+        h    = s.get_value('height')
+        w    = s.get_value('width')
+
+        ok, map_info = buf.map(_Gst.MapFlags.READ)
+        if not ok:
+            return False, None
+        try:
+            frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape(h, w, 3).copy()
+        except Exception:
+            return False, None
+        finally:
+            buf.unmap(map_info)
+
+        if frame.size == 0:
             return False, None
         return True, frame
 
     def isOpened(self):
-        return self.video_capture is not None and self.video_capture.isOpened()
+        return self._opened
 
     def release(self):
-        if self.video_capture is not None:
-            try:
-                self.video_capture.release()
-            except Exception:
-                pass
-            self.video_capture = None
+        self._teardown()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _teardown(self):
+        if self._pipeline is not None:
+            if _Gst is not None:
+                self._pipeline.set_state(_Gst.State.NULL)
+            self._pipeline = None
+        self._sink = None
+        self._opened = False

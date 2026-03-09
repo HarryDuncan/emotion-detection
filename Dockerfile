@@ -4,7 +4,7 @@ FROM nvcr.io/nvidia/tensorflow:25.02-tf2-py3
 # 2. Prevent interactive prompts during apt-get
 ENV DEBIAN_FRONTEND=noninteractive
 
-# 3. Install system dependencies for OpenCV and Video4Linux
+# 3. Install system dependencies: OpenCV, Video4Linux, and GStreamer
 RUN apt-get update && apt-get install -y \
     libgl1 \
     libglib2.0-0 \
@@ -13,6 +13,16 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     v4l-utils \
     libv4l-dev \
+    libgstreamer1.0-dev \
+    libgstreamer-plugins-base1.0-dev \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly \
+    gstreamer1.0-libav \
+    gstreamer1.0-tools \
+    python3-gst-1.0 \
+    python3-gi \
+    python3-gi-cairo \
     && rm -rf /var/lib/apt/lists/*
 
 # 4. Set the working directory inside the container

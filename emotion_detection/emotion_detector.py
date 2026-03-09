@@ -2,174 +2,255 @@ import cv2
 from deepface import DeepFace
 from emotion_transforms import emotions_to_color
 import numpy as np
+from collections import deque
+
+# Number of consecutive frames to average per tracked face.
+# Higher = smoother labels, slightly more lag on real expression changes.
+_SMOOTH_WINDOW = 8
+
+# Minimum IoU to consider a new detection as the same face as an existing track.
+_IOU_MATCH_THRESHOLD = 0.25
+
+# Frames a track can go unmatched before it is discarded.
+_MAX_TRACK_AGE = 5
+
+
+def _iou(a, b):
+    """Intersection-over-Union for two bboxes given as (x, y, w, h)."""
+    ax1, ay1 = a[0], a[1]
+    ax2, ay2 = a[0] + a[2], a[1] + a[3]
+    bx1, by1 = b[0], b[1]
+    bx2, by2 = b[0] + b[2], b[1] + b[3]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = a[2] * a[3] + b[2] * b[3] - inter
+    return inter / union if union > 0 else 0.0
+
+
+class _FaceTrack:
+    """Tracks a single face and smooths its emotion scores over a rolling window."""
+
+    def __init__(self, bbox, emotions):
+        self.bbox = bbox
+        self.history: deque = deque(maxlen=_SMOOTH_WINDOW)
+        self.history.append(emotions)
+        self.age = 0
+
+    def update(self, bbox, emotions):
+        self.bbox = bbox
+        self.history.append(emotions)
+        self.age = 0
+
+    @property
+    def smoothed_emotions(self):
+        keys = self.history[0].keys()
+        return {k: float(np.mean([h[k] for h in self.history])) for k in keys}
 
 
 class EmotionDetector:
     """
-    Emotion detection class that handles face detection and emotion analysis.
+    Multi-face emotion detector with temporal smoothing.
+
+    Uses RetinaFace (via DeepFace) for face detection — significantly more
+    accurate than Haar cascades, handles angles and partial occlusion well.
+    Emotions are averaged over a rolling window per tracked face to reduce
+    frame-to-frame jitter.
     """
-    
+
     def __init__(self, load_models_on_init=False):
-        """
-        Initialize the EmotionDetector.
-        
-        Args:
-            load_models_on_init: If True, pre-load DeepFace models during initialization (default: True)
-        """
-        # Load face cascade classifier
-        self.face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        )
-        
         self.models_loaded = False
-        
+        self._tracks: list = []
+        self._logged_keys = False
+
         if load_models_on_init:
             self.load_models()
-    
+
     def load_models(self):
-        """Pre-load DeepFace models"""
+        """Warm up DeepFace / TensorFlow so the first real frame is fast."""
         print("Loading emotion detection models...")
         try:
-            # 224x224 RGB image matches the model's expected input size exactly
-            test_frame = np.ones((224, 224, 3), dtype=np.uint8) * 128
+            test_frame = np.ones((480, 640, 3), dtype=np.uint8) * 128
             try:
-                # detector_backend='skip' tells DeepFace the image is already a
-                # cropped face — avoids an extra face detection pass during warmup
                 DeepFace.analyze(
                     test_frame,
                     actions=['emotion'],
+                    detector_backend='retinaface',
                     enforce_detection=False,
                     silent=True,
                 )
             except Exception as e:
-                print(f"Model loading triggered (expected error: {type(e).__name__})")
+                print(f"Model warmup triggered (expected: {type(e).__name__})")
             self.models_loaded = True
             print("Models loaded successfully")
             return True
         except Exception as e:
             print(f"Error loading models: {e}")
-            if "No face" in str(e) or "face" in str(e).lower():
+            if "face" in str(e).lower():
                 self.models_loaded = True
                 return True
             return False
-    
+
     def detect_emotions_from_frame(self, frame, silent=True):
         """
-        Detect emotions from a single frame.
-        
+        Detect emotions for every face visible in the frame.
+
         Args:
             frame: BGR frame from OpenCV (numpy array)
-            silent: Whether to suppress DeepFace warnings (default: True)
-        
+            silent: Suppress DeepFace log output
+
         Returns:
             dict: {
-                'emotions': dict of emotion scores (0-100),
-                'dominant_emotion': str,
-                'emotion_color_rgb': tuple (R, G, B),
-                'emotion_color_bgr': tuple (B, G, R),
                 'face_detected': bool,
-                'face_bbox': tuple (x, y, w, h) or None
+                'faces': [
+                    {
+                        'emotions':          dict  — smoothed scores (0-100),
+                        'dominant_emotion':  str,
+                        'emotion_color_rgb': tuple (R, G, B),
+                        'emotion_color_bgr': tuple (B, G, R),
+                        'face_bbox':         tuple (x, y, w, h),
+                    },
+                    ...   one entry per detected face
+                ]
             }
-            Returns None if no face detected or error occurred.
         """
         try:
-            # Grayscale used only for fast Haar cascade face detection
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            # Convert the original BGR frame to RGB for DeepFace (not the gray frame —
-            # DeepFace needs colour to produce accurate emotion scores)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Detect faces in the frame
-            faces = self.face_cascade.detectMultiScale(gray_frame, scaleFactor=1.05, minNeighbors=7, minSize=(50, 50))
-
-            if len(faces) == 0:
-                return {
-                    'emotions': {},
-                    'dominant_emotion': None,
-                    'emotion_color_rgb': (0, 0, 0),
-                    'emotion_color_bgr': (0, 0, 0),
-                    'face_detected': False,
-                    'face_bbox': None
-                }
-
-            # Use the first detected face
-            (x, y, w, h) = faces[0]
-
-            # Crop the face ROI and resize to 224x224 — the model's native input size.
-            # Resizing here avoids scaling inside TensorFlow and reduces GPU work.
-            face_roi = rgb_frame[y:y + h, x:x + w]
-            face_roi = cv2.resize(face_roi, (224, 224))
-
-            # detector_backend='skip' tells DeepFace the image is already a cropped
-            # face, so it skips its own (expensive) face detection pass entirely.
-            result = DeepFace.analyze(
-                face_roi,
+            raw = DeepFace.analyze(
+                rgb_frame,
                 actions=['emotion'],
+                detector_backend='retinaface',
                 enforce_detection=False,
                 silent=silent,
             )
-            
-            # Get all emotions from the result
-            emotions = result[0]['emotion']
-            dominant_emotion = result[0]['dominant_emotion']
-            
-            # Convert emotions to RGB color
-            emotion_color_rgb = emotions_to_color(emotions)
-            # Convert RGB to BGR for OpenCV (OpenCV uses BGR format)
-            emotion_color_bgr = (int(emotion_color_rgb[2]), int(emotion_color_rgb[1]), int(emotion_color_rgb[0]))
-            
+
+            # DeepFace always returns a list; guard against unexpected formats.
+            if not raw:
+                self._age_tracks(matched=set())
+                return {'face_detected': False, 'faces': []}
+            if isinstance(raw, dict):
+                raw = [raw]
+
+            # Debug: log keys and facial_area on first call to identify key names.
+            if not getattr(self, '_logged_keys', False):
+                self._logged_keys = True
+                sample = raw[0] if raw else {}
+                fa_sample = sample.get('facial_area') or sample.get('region') or {}
+                print(f"[emotion_detector] DeepFace result keys: {list(sample.keys())}")
+                print(f"[emotion_detector] facial_area/region: {fa_sample}")
+                print(f"[emotion_detector] face_confidence: {sample.get('face_confidence', 'N/A')}")
+
+            # --- build (bbox, emotions) pairs from DeepFace output ---
+            detections = []
+            for r in raw:
+                # Support both 'facial_area' (newer DeepFace) and 'region' (older)
+                fa = r.get('facial_area') or r.get('region') or {}
+                bbox = (
+                    int(fa.get('x', 0)),
+                    int(fa.get('y', 0)),
+                    int(fa.get('w', 0)),
+                    int(fa.get('h', 0)),
+                )
+                # Filter out zero-confidence "no face found" placeholders that
+                # DeepFace inserts when enforce_detection=False finds nothing.
+                confidence = float(r.get('face_confidence', 1.0))
+                if confidence < 0.5:
+                    continue
+                # Also skip degenerate bboxes
+                if bbox[2] < 20 or bbox[3] < 20:
+                    continue
+                detections.append((bbox, r['emotion']))
+
+            if not detections:
+                self._age_tracks(matched=set())
+                return {'face_detected': False, 'faces': []}
+
+            # --- match each detection to an existing track via IoU ---
+            matched_indices: set = set()
+            new_tracks = []
+
+            for bbox, emotions in detections:
+                best_idx, best_iou = -1, _IOU_MATCH_THRESHOLD
+                for i, track in enumerate(self._tracks):
+                    if i in matched_indices:
+                        continue
+                    score = _iou(track.bbox, bbox)
+                    if score > best_iou:
+                        best_iou = score
+                        best_idx = i
+
+                if best_idx >= 0:
+                    self._tracks[best_idx].update(bbox, emotions)
+                    matched_indices.add(best_idx)
+                else:
+                    new_track = _FaceTrack(bbox, emotions)
+                    new_tracks.append(new_track)
+
+            # Age out unmatched tracks; append new ones.
+            self._age_tracks(matched=matched_indices)
+            self._tracks.extend(new_tracks)
+            # Include new tracks in the output set
+            new_track_indices = set(range(len(self._tracks) - len(new_tracks), len(self._tracks)))
+            all_active = matched_indices | new_track_indices
+
+            # --- build output ---
+            faces_out = []
+            for idx in sorted(all_active):
+                if idx >= len(self._tracks):
+                    continue
+                track = self._tracks[idx]
+                smoothed = track.smoothed_emotions
+                dominant = max(smoothed, key=smoothed.get)
+                color_rgb = emotions_to_color(smoothed)
+                color_bgr = (int(color_rgb[2]), int(color_rgb[1]), int(color_rgb[0]))
+                faces_out.append({
+                    'emotions': smoothed,
+                    'dominant_emotion': dominant,
+                    'emotion_color_rgb': color_rgb,
+                    'emotion_color_bgr': color_bgr,
+                    'face_bbox': track.bbox,
+                })
+
             return {
-                'emotions': emotions,
-                'dominant_emotion': dominant_emotion,
-                'emotion_color_rgb': emotion_color_rgb,
-                'emotion_color_bgr': emotion_color_bgr,
-                'face_detected': True,
-                'face_bbox': (x, y, w, h)
+                'face_detected': len(faces_out) > 0,
+                'faces': faces_out,
             }
-        
+
         except Exception as e:
             print(f"Error in emotion detection: {e}")
-            return {
-                'emotions': {},
-                'dominant_emotion': None,
-                'emotion_color_rgb': (0, 0, 0),
-                'emotion_color_bgr': (0, 0, 0),
-                'face_detected': False,
-                'face_bbox': None,
-                'error': str(e)
-            }
-    
+            return {'face_detected': False, 'faces': [], 'error': str(e)}
+
+    def _age_tracks(self, matched: set):
+        """Increment age of unmatched tracks and prune stale ones."""
+        for i, track in enumerate(self._tracks):
+            if i not in matched:
+                track.age += 1
+        self._tracks = [t for t in self._tracks if t.age <= _MAX_TRACK_AGE]
+
     def cleanup(self):
-        """
-        Cleanup resources. Called when the detector is no longer needed.
-        """
-        # DeepFace models are managed internally, no explicit cleanup needed
-        # Face cascade is a simple classifier, no cleanup needed
+        self._tracks.clear()
         self.models_loaded = False
         print("EmotionDetector cleaned up")
-    
+
     def __del__(self):
-        """Destructor - ensures cleanup is called"""
         try:
             self.cleanup()
-        except:
+        except Exception:
             pass
 
 
 # Note: This module only works with frames, not cameras.
-# Camera management should be handled by the calling code (e.g., app.py)
-# This ensures only one camera instance exists and avoids conflicts.
+# Camera management is handled by the calling code (appv2.py).
 
-# For standalone testing
 if __name__ == "__main__":
-    # Example standalone usage
     print("Example usage:")
-    print("  import cv2")
     print("  from emotion_detection.emotion_detector import EmotionDetector")
-    print("  ")
-    print("  detector = EmotionDetector()  # Loads models on init")
+    print("  import cv2")
+    print("  detector = EmotionDetector(load_models_on_init=True)")
     print("  cap = cv2.VideoCapture(0)")
     print("  ret, frame = cap.read()")
     print("  result = detector.detect_emotions_from_frame(frame)")
-    print("  detector.cleanup()  # Clean up when done")
+    print("  for face in result['faces']:")
+    print("      print(face['dominant_emotion'], face['face_bbox'])")
+    print("  detector.cleanup()")

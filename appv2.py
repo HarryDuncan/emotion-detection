@@ -78,23 +78,29 @@ def _camera_reader_loop():
 # Runs emotion detection at up to EMOTION_FPS independently of the stream FPS.
 # Reads from the shared frame cache — never calls camera_input directly.
 # ---------------------------------------------------------------------------
-EMOTION_FPS = 10
-_latest_emotion_result = {'face_detected': False}
+EMOTION_FPS = 30
+_latest_emotion_result = {'face_detected': False, 'faces': []}
 _emotion_result_lock = threading.Lock()
 
 def _emotion_inference_loop():
     """Runs emotion inference. Exits when _stop_event is set."""
     interval = 1.0 / EMOTION_FPS
     print("[emotion] Inference thread started")
+    _dbg_count = 0
     while not _stop_event.is_set():
         if initialization_status.get('emotion_models_loaded'):
             with _frame_lock:
                 frame = _latest_frame_flipped
             if frame is not None:
-                result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+                result = emotion_detector.detect_emotions_from_frame(frame, silent=False)
                 with _emotion_result_lock:
                     _latest_emotion_result.clear()
                     _latest_emotion_result.update(result)
+                _dbg_count += 1
+                if _dbg_count % 30 == 1:
+                    n = len(result.get('faces', []))
+                    err = result.get('error', '')
+                    print(f"[emotion] #{_dbg_count} face_detected={result.get('face_detected')} faces={n} err={err!r}")
         time.sleep(interval)
     print("[emotion] Inference thread stopped")
 
@@ -305,10 +311,18 @@ def video_dominant_emotion():
             with _emotion_result_lock:
                 result = dict(_latest_emotion_result)
 
-            if result.get('face_detected'):
-                x, y, w, h = result['face_bbox']
-                color = result['emotion_color_bgr']
+            for face in result.get('faces', []):
+                x, y, w, h = face['face_bbox']
+                color = face['emotion_color_bgr']
+                label = face.get('dominant_emotion', '')
                 cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                # Draw label above the box with a filled background for readability
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                ty = max(y - 6, th + 4)
+                cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
+                luma = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
+                text_color = (0, 0, 0) if luma > 140 else (255, 255, 255)
+                cv2.putText(frame, label, (x + 2, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
 
             ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
             if ret:

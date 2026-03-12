@@ -100,40 +100,56 @@ def video_dominant_emotion():
     no_camera_frame = _no_camera_frame_bytes()
 
     def generate():
+        # Tell the inference loop a client is watching — it will start running.
+        with _state.emotion_client_lock:
+            _state.emotion_active_clients += 1
+        print(f"[emotion] Client connected   active_clients={_state.emotion_active_clients}")
+
         last_seq = -1
-        while True:
-            with _state.frame_condition:
-                _state.frame_condition.wait_for(
-                    lambda: _state.frame_seq != last_seq, timeout=1.0
-                )
-                frame    = (_state.latest_frame_flipped.copy()
-                            if _state.latest_frame_flipped is not None else None)
-                last_seq = _state.frame_seq
+        try:
+            while True:
+                with _state.frame_condition:
+                    _state.frame_condition.wait_for(
+                        lambda: _state.frame_seq != last_seq, timeout=1.0
+                    )
+                    frame    = (_state.latest_frame_flipped.copy()
+                                if _state.latest_frame_flipped is not None else None)
+                    last_seq = _state.frame_seq
 
-            if frame is None:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
-                continue
+                if frame is None:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + no_camera_frame + b'\r\n')
+                    continue
 
-            with _state.emotion_result_lock:
-                result = dict(_state.latest_emotion_result)
+                with _state.emotion_result_lock:
+                    result = dict(_state.latest_emotion_result)
 
-            for face in result.get('faces', []):
-                x, y, w, h = face['face_bbox']
-                color       = face['emotion_color_bgr']
-                label       = face.get('dominant_emotion', '')
-                cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                ty          = max(y - 6, th + 4)
-                cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
-                luma        = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
-                text_color  = (0, 0, 0) if luma > 140 else (255, 255, 255)
-                cv2.putText(frame, label, (x + 2, ty),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
+                for face in result.get('faces', []):
+                    x, y, w, h = face['face_bbox']
+                    color      = face['emotion_color_bgr']
+                    label      = face.get('dominant_emotion', '')
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                    ty         = max(y - 6, th + 4)
+                    cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
+                    luma       = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
+                    text_color = (0, 0, 0) if luma > 140 else (255, 255, 255)
+                    cv2.putText(frame, label, (x + 2, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
 
-            ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
-            if ret:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+        finally:
+            # Client disconnected — decrement and idle the inference loop if nobody remains.
+            with _state.emotion_client_lock:
+                _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
+            print(f"[emotion] Client disconnected active_clients={_state.emotion_active_clients}")
+            if _state.emotion_active_clients == 0 and not _state.emotion_explicitly_enabled:
+                with _state.emotion_result_lock:
+                    _state.latest_emotion_result.clear()
+                    _state.latest_emotion_result.update({'face_detected': False, 'faces': []})
 
     return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')

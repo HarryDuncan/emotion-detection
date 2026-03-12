@@ -27,6 +27,19 @@ latest_emotion_result = {'face_detected': False, 'faces': []}
 emotion_result_lock   = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Emotion detection activation
+#
+# Inference only runs when at least one of these is true:
+#   • emotion_active_clients > 0  — a client is connected to /video_dominant_emotion
+#   • emotion_explicitly_enabled  — /start_detection was called
+#
+# This avoids burning GPU/CPU on RetinaFace when nothing is consuming the results.
+# ---------------------------------------------------------------------------
+emotion_active_clients    = 0               # incremented/decremented by the streaming generator
+emotion_client_lock       = threading.Lock()
+emotion_explicitly_enabled = False          # toggled by /start_detection and /stop_detection
+
+# ---------------------------------------------------------------------------
 # System initialisation status
 # Written by initialize_system / check_tensorflow_gpu in appv2.py.
 # Read by /health and /status in routes/core.py.

@@ -47,7 +47,9 @@ app.register_blueprint(detection_bp)
 # Subsystems
 # ---------------------------------------------------------------------------
 
-emotion_detector = EmotionDetector(load_models_on_init=True)
+# load_models_on_init=False — models are loaded inside initialize_system()
+# (child process only) so Flask's reloader parent never triggers a GPU load.
+emotion_detector = EmotionDetector(load_models_on_init=False)
 
 _camera_config = {
     **DEFAULT_CAMERA_CONFIG,
@@ -82,10 +84,6 @@ def _camera_reader_loop():
                 _state.frame_timestamp      = t_read
                 _state.frame_seq           += 1
                 _state.frame_condition.notify_all()
-            read_count += 1
-            if read_count % 60 == 0:
-                read_ms = (t_read - t_before) * 1000
-                print(f"[camera] frame #{read_count}  read={read_ms:.1f}ms")
     with _state.frame_condition:
         _state.latest_frame         = None
         _state.latest_frame_flipped = None
@@ -99,23 +97,32 @@ def _camera_reader_loop():
 # ---------------------------------------------------------------------------
 
 def _emotion_inference_loop():
-    interval   = 1.0 / EMOTION_FPS
-    dbg_count  = 0
-    print("[emotion] Inference thread started")
+    interval  = 1.0 / EMOTION_FPS
+    dbg_count = 0
+    print("[emotion] Inference thread started (idle — waiting for active client)")
     while not _state.stop_event.is_set():
-        if _state.initialization_status.get('emotion_models_loaded'):
-            with _state.frame_condition:
-                frame = _state.latest_frame_flipped
-            if frame is not None:
-                result = emotion_detector.detect_emotions_from_frame(frame, silent=False)
-                with _state.emotion_result_lock:
-                    _state.latest_emotion_result.clear()
-                    _state.latest_emotion_result.update(result)
-                dbg_count += 1
-                if dbg_count % 30 == 1:
-                    n   = len(result.get('faces', []))
-                    err = result.get('error', '')
-                    print(f"[emotion] #{dbg_count} face_detected={result.get('face_detected')} faces={n} err={err!r}")
+        # Idle cheaply when nothing is consuming emotion results.
+        needs_inference = (
+            _state.emotion_active_clients > 0
+            or _state.emotion_explicitly_enabled
+        )
+        if not needs_inference or not _state.initialization_status.get('emotion_models_loaded'):
+            time.sleep(0.1)
+            continue
+
+        with _state.frame_condition:
+            frame = _state.latest_frame_flipped
+        if frame is not None:
+            result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+            with _state.emotion_result_lock:
+                _state.latest_emotion_result.clear()
+                _state.latest_emotion_result.update(result)
+            dbg_count += 1
+            if dbg_count % 30 == 1:
+                n   = len(result.get('faces', []))
+                err = result.get('error', '')
+                print(f"[emotion] #{dbg_count} face_detected={result.get('face_detected')} faces={n} clients={_state.emotion_active_clients} err={err!r}")
+
         time.sleep(interval)
     print("[emotion] Inference thread stopped")
 
@@ -149,36 +156,58 @@ def _check_tensorflow_gpu():
 
 
 def initialize_system():
-    """Initialise camera, TensorFlow, and emotion models then start threads."""
+    """
+    Two-phase startup:
+
+    Phase 1 — Camera (immediate)
+        Open the capture device and start the camera-reader thread so frames
+        are available to /video_feed right away.
+
+    Phase 2 — Models (blocking, ~seconds)
+        Load TensorFlow + emotion models.  The inference thread starts after
+        this completes but idles at 0.1 s sleep until a client connects to
+        /video_dominant_emotion or POST /start_detection is called.
+    """
     _state.stop_event.clear()
 
+    # ------------------------------------------------------------------
+    # Phase 1: camera
+    # ------------------------------------------------------------------
     try:
         camera_input._initialize_camera()
         if camera_input.isOpened():
-            print(f"Camera source: device index {_camera_config.get('camera_index', 0)}")
+            print(f"[init] Camera ready — device index {_camera_config.get('camera_index', 0)}")
             _state.initialization_status['camera_ready'] = True
         else:
-            print("No camera available — app will run without video feed.")
+            print("[init] No camera available — video feed will show placeholder.")
             _state.initialization_status['camera_ready'] = False
     except Exception as e:
-        print(f"Camera init failed: {e}")
+        print(f"[init] Camera init failed: {e}")
         _state.initialization_status['camera_ready'] = False
 
+    # Camera reader runs immediately; /video_feed is usable from this point.
+    threading.Thread(target=_camera_reader_loop, daemon=True, name="camera-reader").start()
+
+    # ------------------------------------------------------------------
+    # Phase 2: models (inference stays idle until a route activates it)
+    # ------------------------------------------------------------------
     _check_tensorflow_gpu()
 
     try:
         emotion_detector.load_models()
         _state.initialization_status['emotion_models_loaded'] = emotion_detector.models_loaded
+        print("[init] Emotion models ready — inference will start on demand.")
     except Exception as e:
-        print(f"Emotion models not loaded: {e}")
+        print(f"[init] Emotion models not loaded: {e}")
         _state.initialization_status['emotion_models_loaded'] = False
 
     _state.initialization_status['initializing'] = False
 
-    threading.Thread(target=_camera_reader_loop,    daemon=True, name="camera-reader").start()
+    # Inference thread starts here but immediately enters its idle branch
+    # (emotion_active_clients == 0 and emotion_explicitly_enabled == False).
     threading.Thread(target=_emotion_inference_loop, daemon=True, name="emotion-inference").start()
 
-    print("Initialization complete")
+    print("[init] Initialization complete — camera streaming, inference idle.")
     return True
 
 

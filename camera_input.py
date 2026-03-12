@@ -9,7 +9,7 @@ _Gst = None  # populated on first call to _initialize_camera()
 
 
 DEFAULT_CAMERA_CONFIG = {
-    'camera_fps': 30,
+    'camera_fps': 15,  # 15fps keeps USB bandwidth low over USBIPD — reduces tearing from packet drops
     'camera_index': 0,
     'camera_url': None,      # If set, overrides camera_index (e.g. "udp://@0.0.0.0:1235")
     'camera_width': 640,
@@ -104,11 +104,19 @@ class CameraInput:
     # ------------------------------------------------------------------
 
     def _device_pipeline(self, index, width, height, fps):
-        """MJPG from a local V4L2 webcam."""
+        """MJPG from a local V4L2 webcam.
+
+        The queue after v4l2src decouples USB interrupt transfers from the
+        decode/convert stages, preventing the driver from stalling while
+        downstream elements are busy — which is the other cause of tearing
+        over USBIPD.  leaky=downstream drops the oldest queued frame if the
+        queue fills up, keeping latency low instead of blocking the source.
+        """
         device = f"/dev/video{index}"
         return (
             f"v4l2src device={device} ! "
             f"image/jpeg,width={width},height={height},framerate={fps}/1 ! "
+            f"queue max-size-buffers=2 leaky=downstream ! "
             f"jpegdec ! "
             f"videoconvert ! "
             f"video/x-raw,format=BGR ! "
@@ -165,7 +173,15 @@ class CameraInput:
         if not ok:
             return False, None
         try:
-            frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape(h, w, 3).copy()
+            arr    = np.frombuffer(map_info.data, dtype=np.uint8)
+            stride = map_info.size // h  # actual bytes per row (may include padding)
+            if stride != w * 3:
+                # Row padding present — strip it before reshaping to avoid tearing.
+                frame = np.ascontiguousarray(
+                    arr.reshape(h, stride)[:, : w * 3].reshape(h, w, 3)
+                )
+            else:
+                frame = arr.reshape(h, w, 3).copy()
         except Exception:
             return False, None
         finally:

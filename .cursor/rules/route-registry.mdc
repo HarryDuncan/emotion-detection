@@ -1,0 +1,52 @@
+---
+description: Enforce route spec registration whenever a Flask route is added or modified
+globs: routes/*.py
+alwaysApply: false
+---
+
+# Route Registry Rule
+
+Every Flask route in this project **must** have a matching `define(...)` call immediately above its handler. This populates `REGISTRY` in `routes/registry.py`, which is served by `GET /api-routes`.
+
+## Pattern
+
+```python
+from routes.registry import define
+
+define(
+    name        = 'my_route',          # snake_case, unique
+    path        = '/my-route',         # exact Flask path string
+    methods     = ['GET'],             # list of HTTP methods
+    description = 'What it does.',
+    input       = {                    # omit if no inputs
+        'param': 'type — description',
+    },
+    output      = {
+        'field': 'type — description',
+    },
+)
+
+@bp.route('/my-route', methods=['GET'])
+def my_route():
+    ...
+```
+
+## Rules
+
+- `define(...)` must appear **directly above** its `@bp.route(...)` decorator — no gap.
+- `name` must be unique across all route files.
+- `path` must exactly match the string in `@bp.route(...)`.
+- `methods` must exactly match the list in `@bp.route(...)`.
+- `input` describes query params, JSON body fields, or path variables. Omit if none.
+- `output` describes every key in the JSON response (or `stream` for streaming routes).
+
+## Where routes live
+
+| File | Blueprint | Purpose |
+|---|---|---|
+| `routes/core.py` | `core` | `/`, `/health`, `/status` |
+| `routes/video.py` | `video` | `/video_feed`, `/video_dominant_emotion` |
+| `routes/detection.py` | `detection` | `/start_detection`, `/stop_detection`, `/get_emotions` |
+| `routes/registry.py` | `registry` | `/api-routes` |
+
+New route groups go in a new `routes/<name>.py` file and must be registered in `appv2.py` with `app.register_blueprint(bp)`.

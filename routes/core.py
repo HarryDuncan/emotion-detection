@@ -68,7 +68,15 @@ def index():
 
 @bp.route('/status', methods=['GET'])
 def status():
-    return jsonify(_state.initialization_status)
+    return jsonify({
+        **_state.initialization_status,
+        'emotion_active_clients':    _state.emotion_active_clients,
+        'emotion_explicitly_enabled': _state.emotion_explicitly_enabled,
+        'emotion_running':           (
+            _state.emotion_active_clients > 0
+            or _state.emotion_explicitly_enabled
+        ),
+    })
 
 
 @bp.route('/health', methods=['GET'])

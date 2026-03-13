@@ -23,6 +23,7 @@ define(
     path        = '/',
     methods     = ['GET'],
     description = 'Serves the main web UI.',
+    factory     = True,
     output      = {
         'body': FieldSpec('string', 'text/html — rendered index.html template'),
     },
@@ -42,6 +43,7 @@ define(
     path        = '/status',
     methods     = ['GET'],
     description = 'Raw initialisation status for every subsystem plus live inference state.',
+    factory     = True,
     output      = {
         **_init_status_properties,
         'emotion_active_clients':     FieldSpec('integer', 'Clients currently streaming /video_dominant_emotion', example=0),
@@ -59,6 +61,7 @@ define(
         'Returns HTTP 200 when all subsystems are ready, HTTP 503 otherwise. '
         'Suitable for Docker HEALTHCHECK, load-balancer probes, and monitoring.'
     ),
+    factory     = True,
     output      = {
         'healthy': FieldSpec('boolean', 'True when fully initialised and all subsystems ready'),
         'message': FieldSpec('string',  'Human-readable status summary', enum=['ok', 'initializing', 'degraded']),

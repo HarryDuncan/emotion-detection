@@ -8,7 +8,7 @@ alwaysApply: false
 
 Every Flask route in this project **must** have a matching `define(...)` call immediately above its handler. This populates `REGISTRY` in `routes/registry.py`, which is served by `GET /api-routes`.
 
-## Pattern
+## Pattern — HTTP route
 
 ```python
 from routes.registry import FieldSpec, define
@@ -18,6 +18,7 @@ define(
     path        = '/my-route',      # must exactly match the @bp.route path
     methods     = ['GET'],          # must exactly match the @bp.route methods list
     description = 'What it does.',
+    factory     = False,            # True for standard platform routes; False for app-specific
     input       = {                 # omit if no inputs
         'param': FieldSpec('string', 'Description of the parameter'),
     },
@@ -29,6 +30,31 @@ define(
 @bp.route('/my-route', methods=['GET'])
 def my_route():
     ...
+```
+
+## Pattern — Socket.IO event
+
+```python
+from routes.registry import FieldSpec, define
+from flask_socketio import emit
+
+define(
+    name        = 'my_event',       # snake_case, unique across all route files
+    path        = 'my_event',       # event name (no leading slash)
+    methods     = ['SOCKET'],       # always ['SOCKET'] for Socket.IO handlers
+    description = 'What it does.',
+    factory     = False,            # True for standard platform events
+    input       = {
+        'data': FieldSpec('object', 'Event payload'),
+    },
+    output      = {
+        'status': FieldSpec('string', 'Reply field description'),
+    },
+)
+
+@socketio.on('my_event')
+def handle_my_event(data):
+    emit('my_event_response', {'status': 'ok'})
 ```
 
 ## FieldSpec
@@ -81,11 +107,12 @@ FieldSpec('stream', 'multipart/x-mixed-replace MJPEG — JPEG frames at camera F
 
 ## Rules
 
-- `define(...)` must appear **directly above** its `@bp.route(...)` decorator — no gap.
+- `define(...)` must appear **directly above** its `@bp.route(...)` or `@socketio.on(...)` decorator — no gap.
 - `name` must be unique across all route files.
-- `path` must exactly match the string in `@bp.route(...)`.
-- `methods` must exactly match the list in `@bp.route(...)`.
-- `input` describes query params, JSON body fields, or path variables. Omit entirely if none.
+- `path` must exactly match the string in `@bp.route(...)`. For Socket.IO events, use the event name without a leading slash.
+- `methods` must exactly match the list in `@bp.route(...)`. Use `['SOCKET']` for Socket.IO handlers.
+- `factory=True` for standard platform routes/events: `index`, `health`, `status`, `api_routes`, `start_model_output`, `start_model_stream`. All other routes default to `factory=False`.
+- `input` describes query params, JSON body fields, path variables, or socket payload. Omit entirely if none.
 - `output` must describe every key in the JSON response. Use `stream` type for streaming endpoints.
 - **Never use plain strings as `input`/`output` values** — always use `FieldSpec`.
 
@@ -97,5 +124,6 @@ FieldSpec('stream', 'multipart/x-mixed-replace MJPEG — JPEG frames at camera F
 | `routes/video.py` | `video` | `/video_feed`, `/video_dominant_emotion` |
 | `routes/detection.py` | `detection` | `/start_detection`, `/stop_detection`, `/get_emotions`, `/get_dominant_emotion_color` |
 | `routes/registry.py` | `registry` | `/api-routes` |
+| `routes/socket_events.py` | — (socketio) | `start_model_output`, `start_model_stream`, `/emotion` namespace lifecycle |
 
-New route groups go in a new `routes/<name>.py` file and must be registered in `appv2.py` with `app.register_blueprint(bp)`.
+New HTTP route groups go in a new `routes/<name>.py` file and must be registered in `appv2.py` with `app.register_blueprint(bp)`. New Socket.IO handlers go in `routes/socket_events.py`.

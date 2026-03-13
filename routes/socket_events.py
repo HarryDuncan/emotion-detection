@@ -30,6 +30,8 @@ Client example (JavaScript)
 """
 import state as _state
 from sio import socketio
+from flask_socketio import emit
+from routes.registry import FieldSpec, define
 
 
 # ---------------------------------------------------------------------------
@@ -112,3 +114,45 @@ def on_emotion_disconnect():
         with _state.emotion_result_lock:
             _state.latest_emotion_result.clear()
             _state.latest_emotion_result.update({'face_detected': False, 'faces': []})
+
+
+# ---------------------------------------------------------------------------
+# Generic model output / stream events (default namespace)
+# ---------------------------------------------------------------------------
+
+define(
+    name        = 'start_model_output',
+    path        = 'start_model_output',
+    methods     = ['SOCKET'],
+    description = 'Request a single model output snapshot. Server emits a model_output event in reply.',
+    factory     = True,
+    input       = {
+        'data': FieldSpec('object', 'Optional request payload'),
+    },
+    output      = {
+        'status': FieldSpec('string', 'Streaming state', enum=['streaming']),
+    },
+)
+
+@socketio.on('start_model_output')
+def handle_start_model_output(data):
+    emit('model_output_data', {'status': "streaming"})
+
+
+define(
+    name        = 'start_model_stream',
+    path        = 'start_model_stream',
+    methods     = ['SOCKET'],
+    description = 'Begin a continuous model output stream. Server emits model_stream events until the client disconnects or stops.',
+    factory     = True,
+    input       = {
+        'data': FieldSpec('object', 'Optional request payload'),
+    },
+    output      = {
+        'status': FieldSpec('string', 'Streaming state', enum=['streaming']),
+    },
+)
+
+@socketio.on('start_model_stream')
+def handle_start_model_stream(data):
+    emit('model_stream', {'status': 'streaming'})

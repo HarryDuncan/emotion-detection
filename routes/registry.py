@@ -76,6 +76,7 @@ class RouteSpec:
     path:        str
     methods:     list
     description: str
+    factory:     bool = False   # True for standard platform routes; False for app-specific routes
     input:       dict = field(default_factory=dict)   # {param: FieldSpec}
     output:      dict = field(default_factory=dict)   # {field: FieldSpec}
 
@@ -86,6 +87,7 @@ def _route_to_dict(spec: RouteSpec) -> dict:
         'path':        spec.path,
         'methods':     spec.methods,
         'description': spec.description,
+        'factory':     spec.factory,
         'input':       _schema_to_dict(spec.input),
         'output':      _schema_to_dict(spec.output),
     }
@@ -99,6 +101,7 @@ def define(
     path:        str,
     methods:     list,
     description: str,
+    factory:     bool = False,
     input:       dict = None,
     output:      dict = None,
 ) -> RouteSpec:
@@ -108,6 +111,7 @@ def define(
         path=path,
         methods=methods,
         description=description,
+        factory=factory,
         input=input or {},
         output=output or {},
     )
@@ -122,19 +126,21 @@ def define(
 bp = Blueprint('registry', __name__)
 
 _route_spec_properties = {
-    'name':        FieldSpec('string', 'Unique route identifier'),
-    'path':        FieldSpec('string', 'URL path', example='/health'),
-    'methods':     FieldSpec('array',  'Allowed HTTP methods', items=FieldSpec('string'), example=['GET']),
-    'description': FieldSpec('string', 'Human-readable description of the route'),
-    'input':       FieldSpec('object', 'Request parameter schema (field name → FieldSpec)'),
-    'output':      FieldSpec('object', 'Response field schema (field name → FieldSpec)'),
+    'name':        FieldSpec('string',  'Unique route identifier'),
+    'path':        FieldSpec('string',  'URL path or Socket.IO event name', example='/health'),
+    'methods':     FieldSpec('array',   'HTTP methods or ["SOCKET"] for Socket.IO events', items=FieldSpec('string'), example=['GET']),
+    'description': FieldSpec('string',  'Human-readable description of the route'),
+    'factory':     FieldSpec('boolean', 'True for standard platform routes; False for app-specific routes'),
+    'input':       FieldSpec('object',  'Request parameter schema (field name → FieldSpec)'),
+    'output':      FieldSpec('object',  'Response field schema (field name → FieldSpec)'),
 }
 
 define(
     name        = 'api_routes',
     path        = '/api-routes',
     methods     = ['GET'],
-    description = 'Returns the full API document — every registered route with its name, path, methods, description, and input/output schema.',
+    description = 'Returns the full API document — every registered route with its name, path, methods, description, factory flag, and input/output schema.',
+    factory     = True,
     output      = {
         'routes': FieldSpec('array', 'All registered route specs', items=FieldSpec('object', properties=_route_spec_properties)),
         'total':  FieldSpec('integer', 'Count of registered routes', example=8),

@@ -76,6 +76,7 @@ class EmotionDetector:
                     test_frame,
                     actions=['emotion'],
                     detector_backend='retinaface',
+                    model_name='Facenet512',
                     enforce_detection=False,
                     silent=True,
                 )

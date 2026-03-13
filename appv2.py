@@ -59,8 +59,11 @@ socketio.init_app(
 # (child process only) so Flask's reloader parent never triggers a GPU load.
 emotion_detector = EmotionDetector(load_models_on_init=False)
 
+# CAMERA_GST_PIPELINE: raw GStreamer pipeline (overrides camera_url/camera_index).
+# Example: "udpsrc port=5000 ! application/x-rtp,payload=96 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink"
 _camera_config = {
     **DEFAULT_CAMERA_CONFIG,
+    "camera_gst_pipeline": os.environ.get("CAMERA_GST_PIPELINE") or None,
     "camera_url":   None,
     "camera_index": int(os.environ.get("CAMERA_INDEX", 0)),
 }

@@ -12,6 +12,7 @@ DEFAULT_CAMERA_CONFIG = {
     'camera_fps': 15,  # 15fps keeps USB bandwidth low over USBIPD — reduces tearing from packet drops
     'camera_index': 0,
     'camera_url': None,      # If set, overrides camera_index (e.g. "udp://@0.0.0.0:1235")
+    'camera_gst_pipeline': None,  # If set, used directly (e.g. UDP RTP H264: "udpsrc port=5000 ! ...")
     'camera_width': 640,
     'camera_height': 480,
 }
@@ -21,14 +22,14 @@ DEFAULT_CAMERA_CONFIG = {
 # can inspect raw output from the GStreamer pipeline (stride, color, tearing).
 # Set FRAME_DEBUG = False to disable with zero runtime cost.
 # ---------------------------------------------------------------------------
-FRAME_DEBUG     = True
+FRAME_DEBUG     = False
 FRAME_DEBUG_DIR = '/workspace/debug_frames'   # absolute path inside the container
 FRAME_DEBUG_MAX = 100
 
 
 class CameraInput:
     """
-    Camera capture backed by GStreamer.
+    Camera capture backed by GStreamer (no OpenCV for capture).
 
     The MJPG path:
         v4l2src → image/jpeg caps → jpegdec → videoconvert → BGR appsink
@@ -41,6 +42,13 @@ class CameraInput:
     The appsink is configured for pull mode (emit-signals=false) with a
     max-buffer queue of 1 and drop=true, so pull-sample() always returns the
     most recent complete frame and naturally blocks at the camera's FPS.
+
+    Custom GStreamer pipeline (camera_gst_pipeline config):
+        Use a raw pipeline string for full control. Example — UDP RTP H264:
+            "udpsrc port=5000 ! application/x-rtp,payload=96 ! rtph264depay ! "
+            "h264parse ! avdec_h264 ! videoconvert ! appsink"
+        The pipeline is normalized: appsink gets name=sink, BGR caps, and
+        low-latency settings if not already specified.
     """
 
     def __init__(self, input_config=None):
@@ -71,13 +79,16 @@ class CameraInput:
 
         Gst = self._ensure_gst()
 
-        camera_url = self.config.get('camera_url')
-        index  = self.config.get('camera_index', 0)
-        fps    = self.config.get('camera_fps', 30)
-        width  = self.config.get('camera_width', 640)
-        height = self.config.get('camera_height', 480)
+        gst_pipeline = self.config.get('camera_gst_pipeline')
+        camera_url   = self.config.get('camera_url')
+        index        = self.config.get('camera_index', 0)
+        fps          = self.config.get('camera_fps', 30)
+        width        = self.config.get('camera_width', 640)
+        height       = self.config.get('camera_height', 480)
 
-        if camera_url:
+        if gst_pipeline:
+            pipeline_str = self._normalize_custom_pipeline(gst_pipeline)
+        elif camera_url:
             pipeline_str = self._url_pipeline(camera_url)
         else:
             pipeline_str = self._device_pipeline(index, width, height, fps)
@@ -86,6 +97,10 @@ class CameraInput:
         try:
             self._pipeline = Gst.parse_launch(pipeline_str)
             self._sink = self._pipeline.get_by_name('sink')
+            if self._sink is None:
+                print("[camera] Pipeline must have appsink name=sink (add 'name=sink' to appsink)")
+                self._teardown()
+                return False
 
             change = self._pipeline.set_state(Gst.State.PLAYING)
             if change == Gst.StateChangeReturn.FAILURE:
@@ -105,7 +120,10 @@ class CameraInput:
             if FRAME_DEBUG:
                 os.makedirs(FRAME_DEBUG_DIR, exist_ok=True)
                 print(f"[camera] Frame debug ON — saving first {FRAME_DEBUG_MAX} frames to {FRAME_DEBUG_DIR}")
-            print(f"[camera] GStreamer ready: {width}x{height} @ {fps}fps  device=/dev/video{index}")
+            if gst_pipeline:
+                print(f"[camera] GStreamer ready (custom pipeline)")
+            else:
+                print(f"[camera] GStreamer ready: {width}x{height} @ {fps}fps  device=/dev/video{index}")
             return True
 
         except Exception as e:
@@ -116,6 +134,27 @@ class CameraInput:
     # ------------------------------------------------------------------
     # Pipeline strings
     # ------------------------------------------------------------------
+
+    def _normalize_custom_pipeline(self, pipeline_str):
+        """
+        Normalize a user-provided GStreamer pipeline so it works with CameraInput.
+
+        The pipeline must end with an appsink. We ensure:
+        - appsink has name=sink (required for get_by_name('sink'))
+        - output is BGR (required for read_latest's numpy reshape)
+        """
+        s = pipeline_str.strip()
+        if 'name=sink' not in s and 'appsink' in s:
+            s = s.replace('appsink', 'appsink name=sink', 1)
+        if 'video/x-raw,format=BGR' not in s and 'appsink' in s:
+            s = s.replace('! appsink', '! video/x-raw,format=BGR ! appsink', 1)
+        if 'emit-signals=false' not in s and 'max-buffers=1' not in s and 'appsink' in s:
+            suffix = ' emit-signals=false max-buffers=1 drop=true sync=false'
+            if s.rstrip().endswith('appsink'):
+                s = s.rstrip() + suffix
+            elif not s.rstrip().endswith('"') and not s.rstrip().endswith("'"):
+                s = s.rstrip() + suffix
+        return s
 
     def _device_pipeline(self, index, width, height, fps):
         """MJPG from a local V4L2 webcam.
@@ -138,22 +177,53 @@ class CameraInput:
         )
 
     def _url_pipeline(self, url):
-        """UDP MPEG-TS or HTTP MJPEG stream."""
+        """
+        Remote stream pipelines.
+
+        Supported URL schemes
+        ---------------------
+        rtp+jpeg://:<port>      RTP MJPEG (recommended — GStreamer/FFmpeg sender on Windows)
+            e.g. camera_url = "rtp+jpeg://:5000"
+            Windows sender:
+                gst-launch-1.0 ksvideosrc ! videoconvert ! jpegenc ! rtpjpegpay ! udpsink host=<WSL2_IP> port=5000
+
+        udp://:<port>           Raw MPEG-TS H264 (legacy)
+            e.g. camera_url = "udp://:1235"
+
+        http://...              HTTP MJPEG stream
+            e.g. camera_url = "http://192.168.1.10:8080/video"
+        """
+        appsink = "appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+        queue   = "queue max-size-buffers=4 leaky=downstream"
+
+        if url.startswith("rtp+jpeg://"):
+            # RTP MJPEG — lowest-latency path from a Windows GStreamer/FFmpeg sender.
+            port = url.rsplit(":", 1)[-1] if ":" in url else "5000"
+            return (
+                f"udpsrc port={port} caps=\"application/x-rtp,encoding-name=JPEG,payload=26\" ! "
+                f"{queue} ! "
+                f"rtpjpegdepay ! jpegdec ! "
+                f"videoconvert ! video/x-raw,format=BGR ! "
+                f"{appsink}"
+            )
+
         if url.startswith("udp://"):
+            # Raw MPEG-TS H264 (legacy).
             port = url.rsplit(":", 1)[-1] if ":" in url else "1235"
             return (
                 f"udpsrc port={port} ! "
-                f"tsdemux ! h264parse ! avdec_h264 max-threads=1 ! "
-                f"videoconvert ! "
-                f"video/x-raw,format=BGR ! "
-                f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+                f"{queue} ! "
+                f"tsdemux ! h264parse ! avdec_h264 max-threads=2 ! "
+                f"videoconvert ! video/x-raw,format=BGR ! "
+                f"{appsink}"
             )
+
+        # HTTP MJPEG stream (e.g. IP camera or phone app).
         return (
             f"souphttpsrc location={url} ! "
             f"multipartdemux ! jpegdec ! "
-            f"videoconvert ! "
-            f"video/x-raw,format=BGR ! "
-            f"appsink name=sink emit-signals=false max-buffers=1 drop=true sync=false"
+            f"videoconvert ! video/x-raw,format=BGR ! "
+            f"{appsink}"
         )
 
     # ------------------------------------------------------------------

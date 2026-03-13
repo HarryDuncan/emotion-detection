@@ -1,12 +1,9 @@
 services:
   emotion-app:
     build: .
-    privileged: true  # Necessary for hardware access
-    devices:
-      - "/dev/video0:/dev/video0"
     image: emotion-app-gpu:latest
     container_name: emotion-app
-    # Use host networking to bypass the virtual bridge for UDP performance
+    # Host mode is best for UDP performance; container shares WSL's IP
     network_mode: host
     ipc: host
     ulimits:
@@ -18,9 +15,12 @@ services:
     environment:
       - CUDA_CACHE_PATH=/root/.nv/ComputeCache
       - TF_CPP_MIN_LOG_LEVEL=3
-      - GLOG_minloglevel=2
-      - TF_ENABLE_ONEDNN_OPTS=0
       - PORT=5005
+      - DISPLAY=$DISPLAY  # Allows the container to open a GUI window if needed
+      # UDP RTP H264 from Windows GStreamer sender (ksvideosrc → x264enc → rtph264pay → udpsink)
+      # Windows sender: gst-launch-1.0 ksvideosrc ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=superfast ! rtph264pay ! udpsink host=<WSL2_IP> port=5001
+      # Get WSL2 IP with: ip addr show eth0 | grep 'inet ' (run in WSL)
+      - CAMERA_GST_PIPELINE=udpsrc port=5001 ! application/x-rtp,encoding-name=H264,payload=96 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink
     deploy:
       resources:
         reservations:

@@ -28,10 +28,17 @@ Client example (JavaScript)
         console.log(data.dominant_emotion, data.color_hex);
     });
 """
+import threading
+
 import state as _state
 from sio import socketio
+from flask import request
 from flask_socketio import emit
 from routes.registry import FieldSpec, define
+
+# sid → True for every client currently subscribed to model_output streaming
+_model_output_sids: set = set()
+_model_output_lock  = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -124,35 +131,102 @@ define(
     name        = 'start_model_output',
     path        = 'start_model_output',
     methods     = ['SOCKET'],
-    description = 'Request a single model output snapshot. Server emits a model_output event in reply.',
+    description = (
+        'Begin streaming dominant-emotion results for the first detected face. '
+        'Server emits model_output events on every new inference result until '
+        'the client disconnects or emits stop_model_output.'
+    ),
     factory     = True,
-    input       = {
-        'data': FieldSpec('object', 'Optional request payload'),
-    },
     output      = {
-        'status': FieldSpec('string', 'Streaming state', enum=['streaming']),
+        'face_detected':    FieldSpec('boolean', 'True when at least one face is visible'),
+        'dominant_emotion': FieldSpec('string',  'Dominant emotion of the first face', nullable=True,
+                                     enum=['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']),
     },
 )
 
 @socketio.on('start_model_output')
 def handle_start_model_output(data):
-    emit('model_output_data', {'status': "streaming"})
+    sid = request.sid
+    with _model_output_lock:
+        if sid in _model_output_sids:
+            return  # already streaming for this client
+        _model_output_sids.add(sid)
+
+    with _state.emotion_client_lock:
+        _state.emotion_active_clients += 1
+    print(f"[model_output] stream started   sid={sid}  active={_state.emotion_active_clients}")
+
+    emit('model_output', {'face_detected': False, 'dominant_emotion': None, 'status': 'streaming'})
+    socketio.start_background_task(_model_output_stream, sid)
+
+
+def _model_output_stream(sid):
+    """Per-client background task: emit dominant emotion on every new inference result."""
+    while True:
+        with _model_output_lock:
+            if sid not in _model_output_sids:
+                break
+
+        with _state.emotion_condition:
+            _state.emotion_condition.wait(timeout=1.0)
+
+        with _model_output_lock:
+            if sid not in _model_output_sids:
+                break
+
+        with _state.emotion_result_lock:
+            result = dict(_state.latest_emotion_result)
+
+        faces = result.get('faces', [])
+        dominant = faces[0].get('dominant_emotion') if faces else None
+
+        socketio.emit('model_output', {
+            'face_detected':    result.get('face_detected', False),
+            'dominant_emotion': dominant,
+        }, to=sid)
+
+    print(f"[model_output] stream stopped   sid={sid}")
+
+
+def _stop_model_output(sid):
+    """Deactivate a client's model_output stream and decrement the inference counter."""
+    with _model_output_lock:
+        if sid not in _model_output_sids:
+            return
+        _model_output_sids.discard(sid)
+
+    with _state.emotion_client_lock:
+        _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
+    print(f"[model_output] stream unregistered  sid={sid}  active={_state.emotion_active_clients}")
+
+
+define(
+    name        = 'stop_model_output',
+    path        = 'stop_model_output',
+    methods     = ['SOCKET'],
+    description = 'Stop the model_output stream started by start_model_output.',
+    factory     = True,
+)
+
+@socketio.on('stop_model_output')
+def handle_stop_model_output(data):
+    _stop_model_output(request.sid)
 
 
 define(
     name        = 'start_model_stream',
     path        = 'start_model_stream',
     methods     = ['SOCKET'],
-    description = 'Begin a continuous model output stream. Server emits model_stream events until the client disconnects or stops.',
+    description = 'Reserved for future use — continuous raw model output stream.',
     factory     = True,
-    input       = {
-        'data': FieldSpec('object', 'Optional request payload'),
-    },
-    output      = {
-        'status': FieldSpec('string', 'Streaming state', enum=['streaming']),
-    },
 )
 
 @socketio.on('start_model_stream')
 def handle_start_model_stream(data):
     emit('model_stream', {'status': 'streaming'})
+
+
+@socketio.on('disconnect')
+def handle_default_disconnect():
+    """Clean up any active model_output stream when a default-namespace client disconnects."""
+    _stop_model_output(request.sid)

@@ -6,13 +6,13 @@ from collections import deque
 
 # Number of consecutive frames to average per tracked face.
 # Higher = smoother labels, slightly more lag on real expression changes.
-_SMOOTH_WINDOW = 8
+_SMOOTH_WINDOW = 4
 
 # Minimum IoU to consider a new detection as the same face as an existing track.
 _IOU_MATCH_THRESHOLD = 0.25
 
 # Frames a track can go unmatched before it is discarded.
-_MAX_TRACK_AGE = 5
+_MAX_TRACK_AGE = 2
 
 
 def _iou(a, b):
@@ -122,6 +122,7 @@ class EmotionDetector:
                 actions=['emotion'],
                 detector_backend='retinaface',
                 enforce_detection=False,
+                align=True,
                 silent=silent,
             )
 

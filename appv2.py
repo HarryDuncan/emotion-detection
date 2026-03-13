@@ -23,13 +23,15 @@ from camera_input import CameraInput, DEFAULT_CAMERA_CONFIG
 from emotion_detection.emotion_detector import EmotionDetector
 from gpu_check import verify_gpu
 import state as _state
+from sio import socketio
 
 # Route blueprints — importing these modules executes all define() calls,
 # which populates routes.registry.REGISTRY before the first request arrives.
-from routes.registry  import bp as registry_bp
-from routes.core      import bp as core_bp
-from routes.video     import bp as video_bp
-from routes.detection import bp as detection_bp
+from routes.registry     import bp as registry_bp
+from routes.core         import bp as core_bp
+from routes.video        import bp as video_bp
+from routes.detection    import bp as detection_bp
+import routes.socket_events as _socket_events  # registers @socketio.on handlers
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -42,6 +44,12 @@ app.register_blueprint(registry_bp)
 app.register_blueprint(core_bp)
 app.register_blueprint(video_bp)
 app.register_blueprint(detection_bp)
+
+socketio.init_app(
+    app,
+    cors_allowed_origins='*',
+    async_mode='threading',   # compatible with our threading.Condition state
+)
 
 # ---------------------------------------------------------------------------
 # Subsystems
@@ -117,6 +125,9 @@ def _emotion_inference_loop():
             with _state.emotion_result_lock:
                 _state.latest_emotion_result.clear()
                 _state.latest_emotion_result.update(result)
+            # Signal the Socket.IO broadcaster that a new result is available.
+            with _state.emotion_condition:
+                _state.emotion_condition.notify_all()
             dbg_count += 1
             if dbg_count % 30 == 1:
                 n   = len(result.get('faces', []))
@@ -207,6 +218,9 @@ def initialize_system():
     # (emotion_active_clients == 0 and emotion_explicitly_enabled == False).
     threading.Thread(target=_emotion_inference_loop, daemon=True, name="emotion-inference").start()
 
+    # Socket.IO broadcaster — watches emotion_condition and emits to /emotion clients.
+    _socket_events.start_broadcaster()
+
     print("[init] Initialization complete — camera streaming, inference idle.")
     return True
 
@@ -243,4 +257,4 @@ if __name__ == '__main__':
         initialize_system()
 
     port = int(os.environ.get('PORT', 5005))
-    app.run(debug=True, threaded=True, port=port, host='0.0.0.0')
+    socketio.run(app, debug=True, port=port, host='0.0.0.0', allow_unsafe_werkzeug=True)

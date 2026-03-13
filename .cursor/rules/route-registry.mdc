@@ -11,18 +11,18 @@ Every Flask route in this project **must** have a matching `define(...)` call im
 ## Pattern
 
 ```python
-from routes.registry import define
+from routes.registry import FieldSpec, define
 
 define(
-    name        = 'my_route',          # snake_case, unique
-    path        = '/my-route',         # exact Flask path string
-    methods     = ['GET'],             # list of HTTP methods
+    name        = 'my_route',       # snake_case, unique across all route files
+    path        = '/my-route',      # must exactly match the @bp.route path
+    methods     = ['GET'],          # must exactly match the @bp.route methods list
     description = 'What it does.',
-    input       = {                    # omit if no inputs
-        'param': 'type — description',
+    input       = {                 # omit if no inputs
+        'param': FieldSpec('string', 'Description of the parameter'),
     },
     output      = {
-        'field': 'type — description',
+        'field': FieldSpec('boolean', 'Description'),
     },
 )
 
@@ -31,14 +31,63 @@ def my_route():
     ...
 ```
 
+## FieldSpec
+
+Every `input` and `output` value **must** be a `FieldSpec` instance, not a plain string.
+
+```python
+FieldSpec(type, description='', *, nullable=False, enum=[], example=None, items=None, properties={})
+```
+
+| Argument | When to use |
+|---|---|
+| `type` | Required. One of: `string`, `boolean`, `integer`, `number`, `array`, `object`, `null`, `stream` |
+| `description` | Human-readable explanation of the field's purpose |
+| `nullable` | Set `True` when the field can be `null` |
+| `enum` | List of allowed string values, e.g. `['ok', 'error']` |
+| `example` | A representative value shown in the API doc, e.g. `'#FFD700'` |
+| `items` | For `array` types — a `FieldSpec` describing each element |
+| `properties` | For `object` types — `{field_name: FieldSpec}` describing nested fields |
+
+### Common examples
+
+```python
+# Simple scalar
+FieldSpec('string', 'The user-facing message')
+FieldSpec('boolean', 'True when the system is ready')
+FieldSpec('integer', 'Number of active clients', example=0)
+
+# Enum
+FieldSpec('string', enum=['enabled', 'disabled', 'still_active'])
+
+# Nullable
+FieldSpec('string', 'Dominant emotion name', nullable=True, enum=['happy', 'sad', 'angry', 'neutral'])
+
+# Array of scalars
+FieldSpec('array', '[r, g, b] each 0-255', items=FieldSpec('integer'), example=[255, 215, 0])
+
+# Array of strings
+FieldSpec('array', 'GPU device names', items=FieldSpec('string'), example=['GPU:0'])
+
+# Nested object
+FieldSpec('object', 'Initialization snapshot', properties={
+    'camera_ready':          FieldSpec('boolean'),
+    'emotion_models_loaded': FieldSpec('boolean'),
+})
+
+# Streaming response (no JSON body)
+FieldSpec('stream', 'multipart/x-mixed-replace MJPEG — JPEG frames at camera FPS')
+```
+
 ## Rules
 
 - `define(...)` must appear **directly above** its `@bp.route(...)` decorator — no gap.
 - `name` must be unique across all route files.
 - `path` must exactly match the string in `@bp.route(...)`.
 - `methods` must exactly match the list in `@bp.route(...)`.
-- `input` describes query params, JSON body fields, or path variables. Omit if none.
-- `output` describes every key in the JSON response (or `stream` for streaming routes).
+- `input` describes query params, JSON body fields, or path variables. Omit entirely if none.
+- `output` must describe every key in the JSON response. Use `stream` type for streaming endpoints.
+- **Never use plain strings as `input`/`output` values** — always use `FieldSpec`.
 
 ## Where routes live
 
@@ -46,7 +95,7 @@ def my_route():
 |---|---|---|
 | `routes/core.py` | `core` | `/`, `/health`, `/status` |
 | `routes/video.py` | `video` | `/video_feed`, `/video_dominant_emotion` |
-| `routes/detection.py` | `detection` | `/start_detection`, `/stop_detection`, `/get_emotions` |
+| `routes/detection.py` | `detection` | `/start_detection`, `/stop_detection`, `/get_emotions`, `/get_dominant_emotion_color` |
 | `routes/registry.py` | `registry` | `/api-routes` |
 
 New route groups go in a new `routes/<name>.py` file and must be registered in `appv2.py` with `app.register_blueprint(bp)`.

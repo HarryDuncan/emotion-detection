@@ -16,6 +16,15 @@ DEFAULT_CAMERA_CONFIG = {
     'camera_height': 480,
 }
 
+# ---------------------------------------------------------------------------
+# Frame debug — saves the first FRAME_DEBUG_MAX decoded frames to disk so you
+# can inspect raw output from the GStreamer pipeline (stride, color, tearing).
+# Set FRAME_DEBUG = False to disable with zero runtime cost.
+# ---------------------------------------------------------------------------
+FRAME_DEBUG     = True
+FRAME_DEBUG_DIR = '/workspace/debug_frames'   # absolute path inside the container
+FRAME_DEBUG_MAX = 100
+
 
 class CameraInput:
     """
@@ -39,6 +48,7 @@ class CameraInput:
         self._sink = None
         self._opened = False
         self.config = {**DEFAULT_CAMERA_CONFIG, **(input_config or {})}
+        self._debug_saved = 0   # frames written so far in the current session
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -91,6 +101,10 @@ class CameraInput:
                 return False
 
             self._opened = True
+            self._debug_saved = 0
+            if FRAME_DEBUG:
+                os.makedirs(FRAME_DEBUG_DIR, exist_ok=True)
+                print(f"[camera] Frame debug ON — saving first {FRAME_DEBUG_MAX} frames to {FRAME_DEBUG_DIR}")
             print(f"[camera] GStreamer ready: {width}x{height} @ {fps}fps  device=/dev/video{index}")
             return True
 
@@ -189,7 +203,22 @@ class CameraInput:
 
         if frame.size == 0:
             return False, None
+
+        if FRAME_DEBUG and self._debug_saved < FRAME_DEBUG_MAX:
+            self._debug_frame(frame)
+
         return True, frame
+
+    def _debug_frame(self, frame: np.ndarray):
+        """Write a single debug frame to disk (called only while FRAME_DEBUG is True)."""
+        import cv2
+        self._debug_saved += 1
+        path = os.path.join(FRAME_DEBUG_DIR, f'frame_{self._debug_saved:04d}.jpg')
+        cv2.imwrite(path, frame)
+        if self._debug_saved == 1:
+            print(f"[camera] debug frame 1/{FRAME_DEBUG_MAX} → {path}")
+        if self._debug_saved == FRAME_DEBUG_MAX:
+            print(f"[camera] debug capture complete — {FRAME_DEBUG_MAX} frames in {FRAME_DEBUG_DIR}")
 
     def isOpened(self):
         return self._opened

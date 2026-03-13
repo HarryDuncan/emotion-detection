@@ -25,6 +25,9 @@ frame_seq            = 0   # monotonically increments on every new frame
 # ---------------------------------------------------------------------------
 latest_emotion_result = {'face_detected': False, 'faces': []}
 emotion_result_lock   = threading.Lock()
+# Notified (with emotion_result_lock NOT held) every time latest_emotion_result
+# is updated by the inference loop.  The Socket.IO broadcaster waits on this.
+emotion_condition     = threading.Condition()
 
 # ---------------------------------------------------------------------------
 # Emotion detection activation

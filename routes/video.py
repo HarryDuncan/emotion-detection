@@ -14,7 +14,7 @@ import numpy as np
 from flask import Blueprint, Response
 
 import state as _state
-from routes.registry import define
+from routes.registry import FieldSpec, define
 
 bp = Blueprint('video', __name__)
 
@@ -31,7 +31,14 @@ define(
     path        = '/video_feed',
     methods     = ['GET'],
     description = 'Raw MJPEG video stream from the camera with no annotation.',
-    output      = {'stream': 'multipart/x-mixed-replace — JPEG frames at camera FPS'},
+    output      = {
+        'stream': FieldSpec(
+            'stream',
+            'multipart/x-mixed-replace boundary=frame — '
+            'continuous JPEG frames delivered at camera FPS (default 15 fps). '
+            'Displays a grey placeholder frame when no camera is available.',
+        ),
+    },
 )
 
 define(
@@ -40,9 +47,19 @@ define(
     methods     = ['GET'],
     description = (
         'MJPEG video stream with per-face bounding boxes and dominant emotion '
-        'labels overlaid, sourced from the background inference thread.'
+        'labels overlaid. Connecting to this endpoint automatically activates '
+        'the background inference loop; disconnecting idles it when no other '
+        'clients remain and /start_detection has not been called.'
     ),
-    output      = {'stream': 'multipart/x-mixed-replace — annotated JPEG frames at camera FPS'},
+    output      = {
+        'stream': FieldSpec(
+            'stream',
+            'multipart/x-mixed-replace boundary=frame — '
+            'annotated JPEG frames at camera FPS. '
+            'Each face is outlined in a color matching its dominant emotion, '
+            'with the emotion label rendered inside the bounding box.',
+        ),
+    },
 )
 
 # ---------------------------------------------------------------------------

@@ -10,13 +10,19 @@ GET  /get_emotions     — stub
 from flask import Blueprint, jsonify
 
 import state as _state
-from routes.registry import define
+from routes.registry import FieldSpec, define
 
 bp = Blueprint('detection', __name__)
 
 # ---------------------------------------------------------------------------
 # Route definitions
 # ---------------------------------------------------------------------------
+
+_detection_state_output = {
+    'status':             FieldSpec('string', 'Current inference state', enum=['enabled', 'disabled', 'still_active']),
+    'active_clients':     FieldSpec('integer', 'Clients currently streaming /video_dominant_emotion', example=0),
+    'explicitly_enabled': FieldSpec('boolean', 'Whether /start_detection is in effect'),
+}
 
 define(
     name        = 'start_detection',
@@ -28,9 +34,8 @@ define(
         '/video_dominant_emotion and stops when they disconnect.'
     ),
     output      = {
-        'status':           'str — "enabled"',
-        'active_clients':   'int — number of /video_dominant_emotion clients',
-        'explicitly_enabled': 'bool',
+        **_detection_state_output,
+        'status': FieldSpec('string', enum=['enabled']),
     },
 )
 
@@ -40,12 +45,11 @@ define(
     methods     = ['POST'],
     description = (
         'Explicitly disable background emotion inference. '
-        'Has no effect while clients are connected to /video_dominant_emotion.'
+        'Returns still_active if /video_dominant_emotion clients remain connected.'
     ),
     output      = {
-        'status':           'str — "disabled" | "still_active" (clients still connected)',
-        'active_clients':   'int',
-        'explicitly_enabled': 'bool',
+        **_detection_state_output,
+        'status': FieldSpec('string', enum=['disabled', 'still_active']),
     },
 )
 
@@ -54,14 +58,37 @@ define(
     path        = '/get_emotions',
     methods     = ['GET'],
     description = (
-        '(Stub) Returns current emotion data. Disabled in appv2 — '
-        'use /video_dominant_emotion for live per-frame inference.'
+        '(Stub) Not implemented in appv2 — '
+        'use /video_dominant_emotion for live annotated stream '
+        'or /get_dominant_emotion_color for the current snapshot.'
     ),
     output      = {
-        'emotions':        'dict — empty in appv2',
-        'scores_out_of_10':'dict — empty in appv2',
-        'timestamp':       'null',
-        'message':         'str',
+        'emotions':         FieldSpec('object', 'Always empty in appv2', example={}),
+        'scores_out_of_10': FieldSpec('object', 'Always empty in appv2', example={}),
+        'timestamp':        FieldSpec('null',   'Always null in appv2'),
+        'message':          FieldSpec('string', example='Emotion detection disabled in appv2.'),
+    },
+)
+
+_emotions_enum = ['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']
+
+define(
+    name        = 'get_dominant_emotion_color',
+    path        = '/get_dominant_emotion_color',
+    methods     = ['GET'],
+    description = (
+        'Returns the dominant emotion and its associated color for the most '
+        'prominent detected face. Color is provided as hex, RGB, and BGR. '
+        'Returns face_detected=false when no face is visible or inference is not running. '
+        'Start inference first with POST /start_detection or by opening /video_dominant_emotion.'
+    ),
+    output      = {
+        'face_detected':    FieldSpec('boolean', 'False when no face is visible or inference is idle'),
+        'dominant_emotion': FieldSpec('string',  'Most confident emotion for the largest face', nullable=True, enum=_emotions_enum),
+        'color_hex':        FieldSpec('string',  'CSS hex color matching the dominant emotion', nullable=True, example='#FFD700'),
+        'color_rgb':        FieldSpec('array',   '[r, g, b] each 0-255', nullable=True, items=FieldSpec('integer'), example=[255, 215, 0]),
+        'color_bgr':        FieldSpec('array',   '[b, g, r] each 0-255 — OpenCV channel order', nullable=True, items=FieldSpec('integer'), example=[0, 215, 255]),
+        'face_count':       FieldSpec('integer', 'Total faces currently detected in the frame', example=1),
     },
 )
 
@@ -97,4 +124,36 @@ def get_emotions():
         'scores_out_of_10': {},
         'timestamp':        None,
         'message':          'Emotion detection disabled in appv2.',
+    })
+
+
+@bp.route('/get_dominant_emotion_color', methods=['GET'])
+def get_dominant_emotion_color():
+    with _state.emotion_result_lock:
+        result = dict(_state.latest_emotion_result)
+
+    faces = result.get('faces', [])
+    if not result.get('face_detected') or not faces:
+        return jsonify({
+            'face_detected':    False,
+            'dominant_emotion': None,
+            'color_hex':        None,
+            'color_rgb':        None,
+            'color_bgr':        None,
+            'face_count':       0,
+        })
+
+    # Use the first face (largest, as RetinaFace returns them sorted by size).
+    face      = faces[0]
+    emotion   = face.get('dominant_emotion', '')
+    bgr       = face.get('emotion_color_bgr', (128, 128, 128))
+    b, g, r   = int(bgr[0]), int(bgr[1]), int(bgr[2])
+
+    return jsonify({
+        'face_detected':    True,
+        'dominant_emotion': emotion,
+        'color_hex':        f'#{r:02X}{g:02X}{b:02X}',
+        'color_rgb':        [r, g, b],
+        'color_bgr':        [b, g, r],
+        'face_count':       len(faces),
     })

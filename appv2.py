@@ -31,7 +31,8 @@ from routes.registry     import bp as registry_bp
 from routes.core         import bp as core_bp
 from routes.video        import bp as video_bp
 from routes.detection    import bp as detection_bp
-import routes.socket_events as _socket_events  # registers @socketio.on handlers
+from routes.ws           import sock as _ws_sock   # raw WebSocket /ws endpoint
+import routes.socket_events as _socket_events      # registers @socketio.on handlers
 
 # ---------------------------------------------------------------------------
 # Flask app
@@ -44,6 +45,7 @@ app.register_blueprint(registry_bp)
 app.register_blueprint(core_bp)
 app.register_blueprint(video_bp)
 app.register_blueprint(detection_bp)
+_ws_sock.init_app(app)   # registers /ws raw WebSocket route
 
 socketio.init_app(
     app,

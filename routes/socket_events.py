@@ -35,6 +35,7 @@ from sio import socketio
 from flask import request
 from flask_socketio import emit
 from routes.registry import FieldSpec, define
+from binary_pack import EMOTION_OUTPUT_SCHEMA
 
 # sid → True for every client currently subscribed to model_output streaming
 _model_output_sids: set = set()
@@ -133,14 +134,15 @@ define(
     methods     = ['SOCKET'],
     description = (
         'Begin streaming dominant-emotion results for the first detected face. '
-        'Server emits model_output events on every new inference result until '
-        'the client disconnects or emits stop_model_output.'
+        'Server emits model_output events as binary frames (20 bytes, little-endian): '
+        '[int32 face_detected, int32 emotion_id, float32 r, float32 g, float32 b]. '
+        'emotion_id: angry=0 disgust=1 fear=2 happy=3 sad=4 surprise=5 neutral=6 none=-1. '
+        'r/g/b are normalised 0.0–1.0. '
+        'Stream runs until the client disconnects or emits stop_model_output.'
     ),
     factory     = True,
     output      = {
-        'face_detected':    FieldSpec('boolean', 'True when at least one face is visible'),
-        'dominant_emotion': FieldSpec('string',  'Dominant emotion of the first face', nullable=True,
-                                     enum=['angry', 'disgust', 'fear', 'happy', 'sad', 'surprise', 'neutral']),
+        'binary_frame': FieldSpec('string', '20-byte little-endian struct: int32 face_detected, int32 emotion_id, float32 r, float32 g, float32 b'),
     },
 )
 
@@ -156,12 +158,12 @@ def handle_start_model_output(data):
         _state.emotion_active_clients += 1
     print(f"[model_output] stream started   sid={sid}  active={_state.emotion_active_clients}")
 
-    emit('model_output', {'face_detected': False, 'dominant_emotion': None, 'status': 'streaming'})
+    emit('model_output', EMOTION_OUTPUT_SCHEMA.pack({'face_detected': False, 'dominant_emotion': None, 'color_rgb': [0, 0, 0]}))
     socketio.start_background_task(_model_output_stream, sid)
 
 
 def _model_output_stream(sid):
-    """Per-client background task: emit dominant emotion on every new inference result."""
+    """Per-client background task: emit dominant-emotion color as binary on every inference result."""
     while True:
         with _model_output_lock:
             if sid not in _model_output_sids:
@@ -178,12 +180,15 @@ def _model_output_stream(sid):
             result = dict(_state.latest_emotion_result)
 
         faces = result.get('faces', [])
-        dominant = faces[0].get('dominant_emotion') if faces else None
+        face  = faces[0] if faces else {}
 
-        socketio.emit('model_output', {
+        payload = {
             'face_detected':    result.get('face_detected', False),
-            'dominant_emotion': dominant,
-        }, to=sid)
+            'dominant_emotion': face.get('dominant_emotion'),
+            'color_rgb':        list(face.get('emotion_color_rgb', (0, 0, 0))),
+        }
+
+        socketio.emit('model_output', EMOTION_OUTPUT_SCHEMA.pack(payload), to=sid)
 
     print(f"[model_output] stream stopped   sid={sid}")
 

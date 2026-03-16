@@ -57,6 +57,31 @@ initialization_status = {
 }
 
 # ---------------------------------------------------------------------------
+# Hardware inputs
+# Set by appv2.py after CameraInput is constructed so route blueprints can
+# call reconnect without importing from appv2 (which would cause a circular
+# import).
+# ---------------------------------------------------------------------------
+camera_input = None   # CameraInput instance; assigned at startup
+
+# ---------------------------------------------------------------------------
+# Output extractor configuration
+# Set by POST /set-config.  Determines which fields are packed into every
+# binary frame emitted by the /ws WebSocket endpoint.
+#
+# compiled_schema  — BinarySchema built from the selected extractor fields
+# compiled_specs   — list[OutputSpec] to call once per frame (in order)
+# output_config    — list of extractor names (the raw config, for /set-config
+#                    to echo back and for /get-config to read)
+#
+# Initialised to None; ws.py falls back to output_registry.DEFAULT_* when None.
+# ---------------------------------------------------------------------------
+output_config_lock = threading.Lock()
+output_config      = None   # list[str] | None
+compiled_schema    = None   # BinarySchema | None
+compiled_specs     = None   # list[OutputSpec] | None
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # Set by _shutdown to signal all background threads to exit.
 # ---------------------------------------------------------------------------

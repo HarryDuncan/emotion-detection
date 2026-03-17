@@ -54,17 +54,23 @@ _EMOTIONS_ORDER = list(EMOTION_IDS.keys())  # stable order for all_emotions pack
 @dataclass
 class OutputSpec:
     """
-    Describes one named model output extractor.
+    Describes one named model output.
 
-    name        — unique key used in set_config requests
-    description — shown in GET /api-routes and set_config response
+    name        — unique key used in set-config requests
+    description — shown in GET /available-outputs
     extract     — callable(detection_result: dict) → flat dict of values
+                  None for non-binary outputs (e.g. video_stream)
     fields      — binary fields this extractor contributes to the packed frame
+                  empty list for non-binary outputs
+    kind        — 'binary' (packed into /ws frames) | 'video' (separate stream)
+    endpoint    — WebSocket endpoint URL for kind='video'; empty for kind='binary'
     """
     name:        str
     description: str
-    extract:     object   # Callable[[dict], dict]
+    extract:     object   # Callable[[dict], dict] | None
     fields:      list     # list[Field]
+    kind:        str = 'binary'   # 'binary' | 'video'
+    endpoint:    str = ''         # ws endpoint for non-binary outputs
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +206,19 @@ _reg(OutputSpec(
     ],
 ))
 
+_reg(OutputSpec(
+    name        = 'video_stream',
+    description = (
+        'Annotated JPEG video frames with emotion bounding boxes and labels. '
+        'Streams on /ws/video at camera rate (~15–30 fps). '
+        'Connect with ws.binaryType = "arraybuffer" and decode each message as JPEG.'
+    ),
+    extract     = None,
+    fields      = [],
+    kind        = 'video',
+    endpoint    = '/ws/video',
+))
+
 
 # ---------------------------------------------------------------------------
 # Schema compilation
@@ -209,11 +228,15 @@ def compile_schema(names: list[str]) -> tuple:
     """
     Build a BinarySchema from an ordered list of extractor names.
 
-    Returns (schema, specs) — specs is the list of OutputSpec objects to call
-    per frame.  Fields from all specs are concatenated in order, so the caller
-    only runs struct.pack once per frame.
+    Non-binary outputs (kind != 'binary', e.g. video_stream) are silently
+    skipped — they are handled by their own dedicated endpoints.
+
+    Returns (schema, specs) — specs is the list of binary OutputSpec objects to
+    call per frame.  Fields from all specs are concatenated in order, so the
+    caller only runs struct.pack once per frame.
     """
-    specs      = [OUTPUT_REGISTRY[n] for n in names if n in OUTPUT_REGISTRY]
+    specs      = [OUTPUT_REGISTRY[n] for n in names
+                  if n in OUTPUT_REGISTRY and OUTPUT_REGISTRY[n].kind == 'binary']
     all_fields = [f for spec in specs for f in spec.fields]
     return BinarySchema(all_fields), specs
 
@@ -242,6 +265,25 @@ def schema_description(schema: BinarySchema) -> dict:
         fields.append({'name': f.name, 'type': _fmt_names.get(f.fmt, f.fmt), 'offset': offset, 'size': size})
         offset += size
     return {'size_bytes': schema.size, 'fields': fields}
+
+
+def spec_description(spec: OutputSpec) -> dict:
+    """
+    Describe one OutputSpec in a JSON-serialisable form for GET /available-outputs.
+    Binary specs include a binary schema layout; video specs include their endpoint.
+    """
+    base = {
+        'name':        spec.name,
+        'description': spec.description,
+        'kind':        spec.kind,
+    }
+    if spec.kind == 'binary':
+        single_schema, _ = compile_schema([spec.name])
+        base['schema']   = schema_description(single_schema)
+    else:
+        base['endpoint'] = spec.endpoint
+        base['format']   = 'jpeg_binary'
+    return base
 
 
 # ---------------------------------------------------------------------------

@@ -70,7 +70,8 @@ _camera_config = {
     "camera_index": int(os.environ.get("CAMERA_INDEX", 0)),
 }
 camera_input = CameraInput(_camera_config)
-_state.camera_input = camera_input   # expose to route blueprints via state
+_state.camera_input     = camera_input      # expose to route blueprints via state
+_state.emotion_detector = emotion_detector  # expose to route blueprints via state
 
 # ---------------------------------------------------------------------------
 # Camera reader thread

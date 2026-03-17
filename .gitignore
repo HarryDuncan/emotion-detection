@@ -6,3 +6,5 @@ train/*
 .environment/*
 venv/*
 .venv/*
+.nv_cache/*
+*.tflite

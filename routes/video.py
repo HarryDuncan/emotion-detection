@@ -14,6 +14,7 @@ import numpy as np
 from flask import Blueprint, Response
 
 import state as _state
+from frame_utils import annotate_frame
 from routes.registry import FieldSpec, define
 
 bp = Blueprint('video', __name__)
@@ -141,18 +142,7 @@ def video_dominant_emotion():
                 with _state.emotion_result_lock:
                     result = dict(_state.latest_emotion_result)
 
-                for face in result.get('faces', []):
-                    x, y, w, h = face['face_bbox']
-                    color      = face['emotion_color_bgr']
-                    label      = face.get('dominant_emotion', '')
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-                    ty         = max(y - 6, th + 4)
-                    cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
-                    luma       = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
-                    text_color = (0, 0, 0) if luma > 140 else (255, 255, 255)
-                    cv2.putText(frame, label, (x + 2, ty),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
+                annotate_frame(frame, result)
 
                 ret, buffer = cv2.imencode('.jpg', frame, _jpeg_params)
                 if ret:

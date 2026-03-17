@@ -3,9 +3,10 @@ Core routes — system health and status.
 
 Endpoints
 ---------
-GET /          — main web UI
-GET /status    — raw initialisation status object
-GET /health    — health check (200 ok / 503 degraded)
+GET  /           — main web UI
+GET  /status     — raw initialisation status object
+GET  /health     — health check (200 ok / 503 degraded)
+POST /initialize — connect camera + load models, return full status
 """
 from flask import Blueprint, jsonify, render_template
 
@@ -69,6 +70,24 @@ define(
     },
 )
 
+define(
+    name        = 'initialize',
+    path        = '/initialize',
+    methods     = ['POST'],
+    description = (
+        'Connect camera inputs and load emotion detection models. '
+        'Blocks until both complete (model loading may take 30–60 s on first run). '
+        'Safe to call multiple times — skips steps already completed. '
+        'Returns the full initialization status.'
+    ),
+    factory     = True,
+    output      = {
+        **_init_status_properties,
+        'camera_error': FieldSpec('string', 'Error message if camera failed to open', example=None),
+        'model_error':  FieldSpec('string', 'Error message if model loading failed',  example=None),
+    },
+)
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -111,3 +130,45 @@ def health():
         message = 'degraded: ' + ', '.join(missing)
 
     return jsonify({'healthy': ready, 'message': message, 'status': s}), (200 if ready else 503)
+
+
+@bp.route('/initialize', methods=['POST'])
+def initialize():
+    errors = {}
+
+    # --- Camera ---
+    cam = _state.camera_input
+    if cam is not None and not cam.isOpened():
+        print('[initialize] Connecting camera...')
+        try:
+            ok = cam._initialize_camera()
+            _state.initialization_status['camera_ready'] = bool(ok)
+            if not ok:
+                errors['camera_error'] = 'Pipeline opened but no frames available — check sender.'
+        except Exception as e:
+            _state.initialization_status['camera_ready'] = False
+            errors['camera_error'] = str(e)
+            print(f'[initialize] Camera error: {e}')
+    else:
+        if cam is None:
+            errors['camera_error'] = 'System still starting up — camera_input not yet assigned.'
+
+    # --- Models ---
+    detector = _state.emotion_detector
+    if detector is not None and not detector.models_loaded:
+        print('[initialize] Loading emotion models (this may take 30–60 s)...')
+        try:
+            detector.load_models()
+            _state.initialization_status['emotion_models_loaded'] = detector.models_loaded
+            print('[initialize] Models loaded.')
+        except Exception as e:
+            _state.initialization_status['emotion_models_loaded'] = False
+            errors['model_error'] = str(e)
+            print(f'[initialize] Model load error: {e}')
+    elif detector is None:
+        errors['model_error'] = 'System still starting up — emotion_detector not yet assigned.'
+
+    _state.initialization_status['initializing'] = False
+
+    status = (200 if not errors else 207)   # 207 Multi-Status — partial success
+    return jsonify({**_state.initialization_status, **errors}), status

@@ -1,20 +1,20 @@
 """
-Raw WebSocket endpoint — low-latency binary model output.
+Raw WebSocket endpoints — low-latency binary model output and annotated video.
 
-Connect
--------
-    ws://host:5005/ws?routes=start_model_output
+Endpoints
+---------
+/ws?routes=start_model_output
+    Binary model data frames at inference rate.
+    Frame layout set by POST /set-config; GET /get-config returns current schema.
+    Default: 24-byte little-endian frame (see schema below).
 
-The server immediately begins sending binary frames on every inference result.
-The frame layout is determined by the active output config (POST /set-config).
-Disconnect to stop.
+/ws/video
+    Annotated JPEG frames at camera rate.
+    Each WebSocket message is a raw JPEG image with bounding boxes and emotion
+    labels drawn on it. Connect, set binaryType = 'arraybuffer', draw on canvas.
 
-You can also connect without the query param and send a text message:
-    start_model_output   — begin streaming
-    stop_model_output    — stop streaming (server closes)
-
-Default wire format (24 bytes, little-endian — no set-config called)
----------------------------------------------------------------------
+Default /ws wire format (24 bytes, little-endian — no set-config called)
+-------------------------------------------------------------------------
     offset  0   int32   face_detected    0 or 1
     offset  4   int32   face_count       total faces in frame
     offset  8   int32   dominant_emotion angry=0 disgust=1 fear=2 happy=3
@@ -23,30 +23,28 @@ Default wire format (24 bytes, little-endian — no set-config called)
     offset 16   float32 color_g
     offset 20   float32 color_b
 
-Call GET /get-config to retrieve the current schema so your client can parse
-the frames correctly after any set-config call.
-
-JavaScript client example
---------------------------
-    const ws = new WebSocket('ws://localhost:5005/ws?routes=start_model_output');
+JavaScript /ws/video client example
+-------------------------------------
+    const ws = new WebSocket('ws://localhost:5005/ws/video');
     ws.binaryType = 'arraybuffer';
-    ws.onmessage = ({ data }) => {
-        // parse according to GET /get-config schema
-        const v = new DataView(data);
-        const face_detected    = v.getInt32(0,  true);
-        const face_count       = v.getInt32(4,  true);
-        const dominant_emotion = v.getInt32(8,  true);  // -1 = no face
-        const r                = v.getFloat32(12, true);
-        const g                = v.getFloat32(16, true);
-        const b                = v.getFloat32(20, true);
+    ws.onmessage = async ({ data }) => {
+        const bitmap = await createImageBitmap(new Blob([data], { type: 'image/jpeg' }));
+        ctx.drawImage(bitmap, 0, 0);
     };
 """
+import os
+
+import cv2
 from flask import request
 from flask_sock import Sock
 
 import state as _state
+from frame_utils import annotate_frame, get_background_remover
 from output_registry import DEFAULT_SCHEMA, DEFAULT_SPECS, run_extractors
 from routes.registry import FieldSpec, define
+
+_VIDEO_JPEG_QUALITY = int(os.environ.get('STREAM_JPEG_QUALITY', 70))
+_jpeg_params        = [cv2.IMWRITE_JPEG_QUALITY, _VIDEO_JPEG_QUALITY]
 
 sock = Sock()
 
@@ -64,6 +62,22 @@ define(
     factory     = True,
     output      = {
         'binary_frame': FieldSpec('string', 'Little-endian binary frame — layout defined by active output config (see GET /get-config)'),
+    },
+)
+
+define(
+    name        = 'ws_video',
+    path        = '/ws/video',
+    methods     = ['WEBSOCKET'],
+    description = (
+        'Raw WebSocket endpoint for annotated MJPEG-style video. '
+        'Each message is a raw JPEG binary with emotion bounding boxes and labels drawn. '
+        'Shares inference results with /ws — no duplicate face detection. '
+        'Frontend: set ws.binaryType = "arraybuffer", decode with createImageBitmap.'
+    ),
+    factory     = True,
+    output      = {
+        'jpeg_frame': FieldSpec('binary', 'Raw JPEG bytes — annotated frame with emotion bounding boxes and labels'),
     },
 )
 
@@ -123,10 +137,60 @@ def _stream(ws):
             flat = run_extractors(result, specs)
             ws.send(schema.pack(flat))
 
-    except Exception:
-        # Client disconnected or send error — exit cleanly.
-        pass
+    except Exception as e:
+        print(f"[ws] stream error: {type(e).__name__}: {e}")
     finally:
         with _state.emotion_client_lock:
             _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
         print(f"[ws] stream stopped   active={_state.emotion_active_clients}")
+
+
+# ---------------------------------------------------------------------------
+# /ws/video — annotated JPEG frame stream
+# ---------------------------------------------------------------------------
+
+@sock.route('/ws/video')
+def ws_video_endpoint(ws):
+    _video_stream(ws)
+
+
+def _video_stream(ws):
+    """Activate inference, send annotated JPEG frames until the client disconnects."""
+    with _state.emotion_client_lock:
+        _state.emotion_active_clients += 1
+    print(f"[ws/video] stream started   active={_state.emotion_active_clients}")
+
+    last_seq = -1
+    try:
+        while True:
+            # Wait for the next camera frame (fires at camera rate, ~15–30 fps).
+            with _state.frame_condition:
+                _state.frame_condition.wait_for(
+                    lambda: _state.frame_seq != last_seq, timeout=1.0
+                )
+                frame    = (_state.latest_frame_flipped.copy()
+                            if _state.latest_frame_flipped is not None else None)
+                last_seq = _state.frame_seq
+
+            if frame is None:
+                continue
+
+            # Remove background — initialises MediaPipe on first call (lazy).
+            frame = get_background_remover().remove(frame)
+
+            # Read latest emotion result — already computed by the inference loop.
+            with _state.emotion_result_lock:
+                result = dict(_state.latest_emotion_result)
+
+            annotate_frame(frame, result)
+
+            ret, buf = cv2.imencode('.jpg', frame, _jpeg_params)
+            if ret:
+                ws.send(buf.tobytes())
+
+    except Exception as e:
+        print(f"[ws/video] stream error: {type(e).__name__}: {e}")
+    finally:
+        with _state.emotion_client_lock:
+            _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
+        print(f"[ws/video] stream stopped   active={_state.emotion_active_clients}")

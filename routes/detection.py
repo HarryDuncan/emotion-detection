@@ -21,6 +21,7 @@ from output_registry import (
     compile_schema,
     run_extractors,
     schema_description,
+    spec_description,
     extract_face_detected,
     extract_dominant_emotion,
     extract_dominant_emotion_color,
@@ -296,47 +297,54 @@ def set_config():
             'available': list(OUTPUT_REGISTRY.keys()),
         }), 400
 
-    schema, specs = compile_schema(names)
+    # Binary extractors → compiled schema for /ws frames.
+    # Non-binary outputs (e.g. video_stream) are handled by dedicated endpoints.
+    schema, specs   = compile_schema(names)
+    video_enabled   = 'video_stream' in names
 
     with _state.output_config_lock:
-        _state.output_config   = names
-        _state.compiled_schema = schema
-        _state.compiled_specs  = specs
+        _state.output_config          = names
+        _state.compiled_schema        = schema
+        _state.compiled_specs         = specs
+        _state.video_stream_enabled   = video_enabled
 
-    print(f'[set-config] config={names}  schema={schema}')
+    print(f'[set-config] config={names}  video={video_enabled}  schema={schema}')
     return jsonify({
-        'config':    names,
-        'schema':    schema_description(schema),
-        'available': {n: s.description for n, s in OUTPUT_REGISTRY.items()},
+        'config':         names,
+        'schema':         schema_description(schema),
+        'video_stream':   video_enabled,
+        'streams': {
+            '/ws':        'binary model data (always active when config set)',
+            '/ws/video':  'annotated JPEG frames' if video_enabled else None,
+        },
     })
 
 
 @bp.route('/get-config', methods=['GET'])
 def get_config():
     with _state.output_config_lock:
-        config = _state.output_config
-        schema = _state.compiled_schema
+        config        = _state.output_config
+        schema        = _state.compiled_schema
+        video_enabled = _state.video_stream_enabled
 
     if config is None or schema is None:
         from output_registry import DEFAULT_SCHEMA
-        config = DEFAULT_CONFIG
-        schema = DEFAULT_SCHEMA
+        config        = DEFAULT_CONFIG
+        schema        = DEFAULT_SCHEMA
+        video_enabled = False
 
     return jsonify({
-        'config':    config,
-        'schema':    schema_description(schema),
-        'available': {n: s.description for n, s in OUTPUT_REGISTRY.items()},
+        'config':       config,
+        'schema':       schema_description(schema),
+        'video_stream': video_enabled,
+        'streams': {
+            '/ws':       'binary model data (always active when config set)',
+            '/ws/video': 'annotated JPEG frames' if video_enabled else None,
+        },
     })
 
 
 @bp.route('/available-outputs', methods=['GET'])
 def available_outputs():
-    outputs = []
-    for spec in OUTPUT_REGISTRY.values():
-        single_schema, _ = compile_schema([spec.name])
-        outputs.append({
-            'name':        spec.name,
-            'description': spec.description,
-            'schema':      schema_description(single_schema),
-        })
+    outputs = [spec_description(spec) for spec in OUTPUT_REGISTRY.values()]
     return jsonify({'outputs': outputs})

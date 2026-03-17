@@ -62,7 +62,8 @@ initialization_status = {
 # call reconnect without importing from appv2 (which would cause a circular
 # import).
 # ---------------------------------------------------------------------------
-camera_input = None   # CameraInput instance; assigned at startup
+camera_input     = None   # CameraInput instance; assigned at startup
+emotion_detector = None   # EmotionDetector instance; assigned at startup
 
 # ---------------------------------------------------------------------------
 # Output extractor configuration
@@ -76,10 +77,11 @@ camera_input = None   # CameraInput instance; assigned at startup
 #
 # Initialised to None; ws.py falls back to output_registry.DEFAULT_* when None.
 # ---------------------------------------------------------------------------
-output_config_lock = threading.Lock()
-output_config      = None   # list[str] | None
-compiled_schema    = None   # BinarySchema | None
-compiled_specs     = None   # list[OutputSpec] | None
+output_config_lock    = threading.Lock()
+output_config         = None    # list[str] | None — full config including non-binary names
+compiled_schema       = None    # BinarySchema | None
+compiled_specs        = None    # list[OutputSpec] | None
+video_stream_enabled  = False   # True when 'video_stream' is in the active config
 
 # ---------------------------------------------------------------------------
 # Lifecycle

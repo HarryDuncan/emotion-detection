@@ -13,6 +13,11 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     v4l-utils \
     libv4l-dev \
+    # EGL + OpenGL ES — required for MediaPipe GPU delegate (OpenGL ES via EGL).
+    # Note: libgles2-mesa was merged into libgles2 in Ubuntu 22.04+.
+    libegl1 \
+    libegl-mesa0 \
+    libgles2 \
     # Core GStreamer
     libgstreamer1.0-dev \
     libgstreamer-plugins-base1.0-dev \

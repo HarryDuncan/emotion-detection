@@ -96,6 +96,8 @@ class CameraInput:
         print(f"[camera] GStreamer pipeline: {pipeline_str}")
         try:
             self._pipeline = Gst.parse_launch(pipeline_str)
+
+            
             self._sink = self._pipeline.get_by_name('sink')
             if self._sink is None:
                 print("[camera] Pipeline must have appsink name=sink (add 'name=sink' to appsink)")
@@ -142,6 +144,8 @@ class CameraInput:
         The pipeline must end with an appsink. We ensure:
         - appsink has name=sink (required for get_by_name('sink'))
         - output is BGR (required for read_latest's numpy reshape)
+        - udpsrc has is-live=true so the pipeline doesn't stall waiting for
+          preroll when no UDP data arrives before the 5-second state timeout
         """
         s = pipeline_str.strip()
         if 'name=sink' not in s and 'appsink' in s:

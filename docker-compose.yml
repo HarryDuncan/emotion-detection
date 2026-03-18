@@ -17,6 +17,8 @@ services:
       - TF_CPP_MIN_LOG_LEVEL=3
       - PORT=5005
       - DISPLAY=$DISPLAY  # Allows the container to open a GUI window if needed
+      # EGL_PLATFORM=device: use NVIDIA EGL for headless GPU (MediaPipe GPU delegate)
+      - EGL_PLATFORM=device
       # UDP RTP H264 from Windows GStreamer sender (ksvideosrc → x264enc → rtph264pay → udpsink)
       # Windows sender: gst-launch-1.0 ksvideosrc ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=superfast ! rtph264pay ! udpsink host=<WSL2_IP> port=5001
       # Get WSL2 IP with: ip addr show eth0 | grep 'inet ' (run in WSL)

@@ -16,3 +16,4 @@ retina-face>=0.0.14
 fire>=0.4.0
 gunicorn>=21.0.0
 deepface>=0.0.92
+mediapipe>=0.10.0

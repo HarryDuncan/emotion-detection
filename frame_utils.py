@@ -6,18 +6,65 @@ rendering/processing code lives in exactly one place.
 
 Background removal
 ------------------
-Uses OpenCV MOG2 (Mixture of Gaussians) background subtraction.
-Best for static/near-static cameras — learns the background over ~500 frames
-then reliably isolates the foreground subject.
-No extra dependencies; runs entirely on CPU via opencv-python-headless.
+Uses the MediaPipe Tasks API (ImageSegmenter) with the selfie-segmenter
+landscape model (~1 MB TFLite).  The model is downloaded once on first use
+and cached next to this file.
+
+GPU path:  TFLite GPU delegate (OpenCL / OpenGL ES via EGL).
+           Set EGL_PLATFORM=device in the environment for headless NVIDIA GPU.
+CPU path:  automatic fallback if GPU delegate init fails.
+
+NOTE: mediapipe must be imported before matplotlib/DeepFace to avoid a fatal
+pybind11 ft2font conflict.  The module-level import below ensures this.
 """
+import os
 import threading
+import urllib.request
 
 import cv2
+import mediapipe as mp                          # must stay at module level
 import numpy as np
+from mediapipe.tasks import python as _mp_py
+from mediapipe.tasks.python import vision as _mp_vision
 
-# Morphological kernel for mask cleanup (removes speckling / fills small holes).
-_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+_MODEL_URL  = (
+    'https://storage.googleapis.com/mediapipe-models/'
+    'image_segmenter/selfie_segmenter_landscape/float16/latest/'
+    'selfie_segmenter_landscape.tflite'
+)
+_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'selfie_segmenter.tflite')
+
+
+def _ensure_model() -> str:
+    if not os.path.exists(_MODEL_PATH):
+        print(f'[bg] Downloading selfie segmenter model → {_MODEL_PATH} …')
+        urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+        print('[bg] Model download complete.')
+    return _MODEL_PATH
+
+
+def _build_segmenter() -> _mp_vision.ImageSegmenter:
+    """Try GPU delegate; fall back to CPU if unavailable."""
+    model_path = _ensure_model()
+    for label, delegate in [
+        ('GPU', _mp_py.BaseOptions.Delegate.GPU),
+        ('CPU', _mp_py.BaseOptions.Delegate.CPU),
+    ]:
+        try:
+            opts = _mp_vision.ImageSegmenterOptions(
+                base_options=_mp_py.BaseOptions(
+                    model_asset_path=model_path,
+                    delegate=delegate,
+                ),
+                output_confidence_masks=True,
+            )
+            seg = _mp_vision.ImageSegmenter.create_from_options(opts)
+            print(f'[bg] MediaPipe ImageSegmenter ready on {label}')
+            return seg
+        except Exception as exc:
+            print(f'[bg] {label} delegate failed ({exc}), trying next…')
+    raise RuntimeError('[bg] Could not initialise MediaPipe segmenter on any delegate')
 
 
 # ---------------------------------------------------------------------------
@@ -30,58 +77,33 @@ _remover_lock = threading.Lock()
 
 class BackgroundRemover:
     """
-    MOG2 background subtractor.
+    MediaPipe selfie-segmenter background remover.
 
-    The model warms up over the first ``history`` frames; during warm-up the
-    mask will include more noise.  Once stable it cleanly isolates the
-    foreground subject.
+    ``remove(frame)`` returns a BGR frame with the background replaced by
+    ``bg_color`` (default solid black).
 
-    Parameters
-    ----------
-    history:
-        Number of frames used to build the background model (default 500).
-    var_threshold:
-        Mahalanobis distance threshold — lower = more sensitive to change,
-        higher = only large changes count as foreground (default 40).
-    learning_rate:
-        How fast the background model updates each frame.
-        0.0 = frozen, 1.0 = full reset every frame, -1 = auto (default 0.005).
-    bg_color:
-        BGR tuple for the replacement background (default black).
+    ``threshold`` (0.0–1.0) sets the minimum foreground confidence required
+    to keep a pixel.  0.5 is a good default; raise it for a tighter mask.
     """
 
-    def __init__(
-        self,
-        history:       int   = 500,
-        var_threshold: float = 40,
-        learning_rate: float = 0.005,
-        bg_color:      tuple = (0, 0, 0),
-    ):
-        self._sub           = cv2.createBackgroundSubtractorMOG2(
-                                  history       = history,
-                                  varThreshold  = var_threshold,
-                                  detectShadows = True,
-                              )
-        self.learning_rate  = learning_rate
-        self.bg_color       = bg_color
-        print('[bg] MOG2 background subtractor initialised')
+    def __init__(self, threshold: float = 0.5):
+        self._seg      = _build_segmenter()
+        self.threshold = threshold
 
-    def remove(self, frame: np.ndarray, bg_color: tuple | None = None) -> np.ndarray:
+    def remove(self, frame: np.ndarray, bg_color: tuple = (0, 0, 0)) -> np.ndarray:
         """Return a copy of *frame* with background replaced by *bg_color*."""
-        color = bg_color if bg_color is not None else self.bg_color
-
-        raw_mask = self._sub.apply(frame, learningRate=self.learning_rate)
-
-        # MOG2 marks shadows as 127 — treat them as background.
-        fg_mask = (raw_mask == 255).astype(np.uint8)
-
-        # Clean up noise: remove small specks, close gaps inside the subject.
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN,  _MORPH_KERNEL)
-        fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, _MORPH_KERNEL)
-
-        mask = fg_mask[:, :, np.newaxis]
-        bg   = np.full_like(frame, color)
+        rgb      = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result   = self._seg.segment(mp_image)
+        # confidence_masks[0] = person foreground confidence (0.0–1.0).
+        # squeeze() ensures 2D regardless of whether MediaPipe returns (H,W) or (H,W,1).
+        conf     = np.squeeze(result.confidence_masks[0].numpy_view())
+        mask     = (conf > self.threshold).astype(np.uint8)[:, :, np.newaxis]
+        bg       = np.full_like(frame, bg_color)
         return (frame * mask + bg * (1 - mask)).astype(np.uint8)
+
+    def close(self):
+        self._seg.close()
 
 
 def get_background_remover() -> BackgroundRemover:

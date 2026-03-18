@@ -27,6 +27,18 @@ import numpy as np
 from mediapipe.tasks import python as _mp_py
 from mediapipe.tasks.python import vision as _mp_vision
 
+from emotion_transforms import EMOTION_COLORS_RGB as _EMOTION_COLORS_RGB
+
+# BGR version of the per-emotion palette (used for OpenCV drawing)
+_EMOTION_COLORS_BGR: dict[str, tuple] = {
+    name: (rgb[2], rgb[1], rgb[0])
+    for name, rgb in _EMOTION_COLORS_RGB.items()
+}
+
+_FONT       = cv2.FONT_HERSHEY_SIMPLEX
+_FONT_SCALE = 0.45
+_FONT_THICK = 1
+
 _MODEL_URL  = (
     'https://storage.googleapis.com/mediapipe-models/'
     'image_segmenter/selfie_segmenter_landscape/float16/latest/'
@@ -116,6 +128,62 @@ def get_background_remover() -> BackgroundRemover:
     return _remover_instance
 
 
+def _top3_lines(face: dict) -> list[tuple[str, tuple]]:
+    """Return [(label_str, bgr_color), ...] for the top-3 emotions by score.
+
+    Each label is formatted as ``"happy  45%"`` and carries the individual
+    emotion's color so rows can be visually distinguished at a glance.
+    """
+    emotions     = face.get('emotions') or {}
+    default_bgr  = face.get('emotion_color_bgr', (128, 128, 128))
+    top3         = sorted(emotions.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    return [
+        (f"{name}  {score:.0f}%", _EMOTION_COLORS_BGR.get(name.lower(), default_bgr))
+        for name, score in top3
+    ]
+
+
+def _text_color(bgr: tuple, *, alpha: int | None = None) -> tuple:
+    """Black or white text depending on background luminance; append alpha if given."""
+    b, g, r = bgr[:3]
+    luma    = 0.299 * r + 0.587 * g + 0.114 * b
+    base    = (0, 0, 0) if luma > 140 else (255, 255, 255)
+    return (*base, alpha) if alpha is not None else base
+
+
+def _draw_top3(canvas: np.ndarray, face: dict) -> None:
+    """Draw bounding box and top-3 emotion labels onto *canvas* in-place.
+
+    Handles both 3-channel BGR frames and 4-channel BGRA transparent canvases.
+    Each of the three label rows uses the individual emotion's palette color so
+    the blend is visible at a glance. Rows are stacked immediately above the
+    bounding box, ordered 1st (top) → 3rd (bottom).
+    """
+    n_ch       = canvas.shape[2]
+    alpha      = 255 if n_ch == 4 else None   # None → omit alpha component
+
+    def _c(bgr):
+        return (*bgr, alpha) if alpha is not None else bgr
+
+    x, y, w, h  = face['face_bbox']
+    bbox_color  = face['emotion_color_bgr']
+
+    cv2.rectangle(canvas, (x, y), (x + w, y + h), _c(bbox_color), 2)
+
+    lines     = _top3_lines(face)
+    cursor_y  = y - 2           # baseline just above the top edge of the bbox
+
+    for label, bgr in reversed(lines):   # draw 3rd → 1st so 1st ends up on top
+        (tw, th), _ = cv2.getTextSize(label, _FONT, _FONT_SCALE, _FONT_THICK)
+        top = max(cursor_y - th - 4, 0)
+        cv2.rectangle(canvas, (x, top), (x + tw + 6, cursor_y + 2),
+                      _c(bgr), cv2.FILLED)
+        cv2.putText(canvas, label, (x + 3, cursor_y - 1),
+                    _FONT, _FONT_SCALE, _text_color(bgr, alpha=alpha),
+                    _FONT_THICK, cv2.LINE_AA)
+        cursor_y = top - 2      # 2 px gap between rows
+
+
 def annotate_data_layer(result: dict, height: int, width: int) -> np.ndarray:
     """Return a transparent BGRA canvas with only the annotation layer drawn.
 
@@ -123,38 +191,24 @@ def annotate_data_layer(result: dict, height: int, width: int) -> np.ndarray:
     label backgrounds, text) are fully opaque (alpha=255). Encode the returned
     array as PNG to preserve the alpha channel — JPEG cannot represent transparency.
 
+    Each face shows the top-3 emotions by score, each row colored with its own
+    emotion palette color, stacked above the bounding box.
+
     Parameters
     ----------
     result:
-        The latest emotion result dict (same format as ``annotate_frame``).
+        The latest emotion result dict from ``_state.latest_emotion_result``.
     height, width:
-        Canvas dimensions — should match the corresponding video frame so the
-        overlay lines up when composited in the browser.
+        Canvas dimensions — should match the video frame for correct compositing.
     """
     canvas = np.zeros((height, width, 4), dtype=np.uint8)
-
     for face in result.get('faces', []):
-        x, y, w, h  = face['face_bbox']
-        b, g, r     = face['emotion_color_bgr']
-        label       = face.get('dominant_emotion', '')
-        color_bgra  = (b, g, r, 255)
-
-        cv2.rectangle(canvas, (x, y), (x + w, y + h), color_bgra, 2)
-
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        ty          = max(y - 6, th + 4)
-        cv2.rectangle(canvas, (x, ty - th - 4), (x + tw + 4, ty + 2), color_bgra, cv2.FILLED)
-
-        luma        = 0.299 * r + 0.587 * g + 0.114 * b
-        text_color  = (0, 0, 0, 255) if luma > 140 else (255, 255, 255, 255)
-        cv2.putText(canvas, label, (x + 2, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
-
+        _draw_top3(canvas, face)
     return canvas
 
 
-def annotate_frame(frame, result: dict) -> None:
-    """Draw per-face emotion bounding boxes and labels onto *frame* in-place.
+def annotate_frame(frame: np.ndarray, result: dict) -> None:
+    """Draw per-face top-3 emotion labels and bounding boxes onto *frame* in-place.
 
     Parameters
     ----------
@@ -162,23 +216,6 @@ def annotate_frame(frame, result: dict) -> None:
         BGR numpy array — modified in-place.
     result:
         The latest emotion result dict from ``_state.latest_emotion_result``.
-        Expected keys per face entry: ``face_bbox``, ``emotion_color_bgr``,
-        ``dominant_emotion``.
     """
     for face in result.get('faces', []):
-        x, y, w, h = face['face_bbox']
-        color       = face['emotion_color_bgr']
-        label       = face.get('dominant_emotion', '')
-
-        # Face bounding box
-        cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
-
-        # Label background + text
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        ty          = max(y - 6, th + 4)
-        cv2.rectangle(frame, (x, ty - th - 4), (x + tw + 4, ty + 2), color, cv2.FILLED)
-
-        luma        = 0.299 * color[2] + 0.587 * color[1] + 0.114 * color[0]
-        text_color  = (0, 0, 0) if luma > 140 else (255, 255, 255)
-        cv2.putText(frame, label, (x + 2, ty),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
+        _draw_top3(frame, face)

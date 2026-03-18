@@ -14,7 +14,7 @@ import numpy as np
 from flask import Blueprint, Response
 
 import state as _state
-from frame_utils import annotate_frame
+from frame_utils import annotate_data_layer, annotate_frame
 from routes.registry import FieldSpec, define
 
 bp = Blueprint('video', __name__)
@@ -154,6 +154,68 @@ def video_dominant_emotion():
             with _state.emotion_client_lock:
                 _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
             print(f"[emotion] Client disconnected active_clients={_state.emotion_active_clients}")
+            if _state.emotion_active_clients == 0 and not _state.emotion_explicitly_enabled:
+                with _state.emotion_result_lock:
+                    _state.latest_emotion_result.clear()
+                    _state.latest_emotion_result.update({'face_detected': False, 'faces': []})
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+define(
+    name        = 'video_data_layer',
+    path        = '/video_data_layer',
+    methods     = ['GET'],
+    description = (
+        'MJPEG-style stream of transparent PNG frames containing only the '
+        'annotation layer (bounding boxes and emotion labels). No camera image '
+        'is included — composite this over /video_feed in the browser to overlay '
+        'annotations without baking them into the video. '
+        'Activates the inference loop while a client is connected.'
+    ),
+    output      = {
+        'stream': FieldSpec(
+            'stream',
+            'multipart/x-mixed-replace boundary=frame — '
+            'RGBA PNG frames at camera FPS. Each frame is fully transparent '
+            'except for the drawn annotation shapes.',
+        ),
+    },
+)
+
+@bp.route('/video_data_layer')
+def video_data_layer():
+    def generate():
+        with _state.emotion_client_lock:
+            _state.emotion_active_clients += 1
+        print(f"[data_layer] Client connected   active_clients={_state.emotion_active_clients}")
+
+        last_seq = -1
+        try:
+            while True:
+                with _state.frame_condition:
+                    _state.frame_condition.wait_for(
+                        lambda: _state.frame_seq != last_seq, timeout=1.0
+                    )
+                    frame    = _state.latest_frame_flipped
+                    last_seq = _state.frame_seq
+
+                h, w = frame.shape[:2] if frame is not None else (480, 640)
+
+                with _state.emotion_result_lock:
+                    result = dict(_state.latest_emotion_result)
+
+                canvas = annotate_data_layer(result, h, w)
+
+                ret, buffer = cv2.imencode('.png', canvas)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/png\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
+        finally:
+            with _state.emotion_client_lock:
+                _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
+            print(f"[data_layer] Client disconnected active_clients={_state.emotion_active_clients}")
             if _state.emotion_active_clients == 0 and not _state.emotion_explicitly_enabled:
                 with _state.emotion_result_lock:
                     _state.latest_emotion_result.clear()

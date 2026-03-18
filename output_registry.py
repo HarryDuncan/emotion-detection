@@ -69,8 +69,9 @@ class OutputSpec:
     description: str
     extract:     object   # Callable[[dict], dict] | None
     fields:      list     # list[Field]
-    kind:        str = 'binary'   # 'binary' | 'video'
-    endpoint:    str = ''         # ws endpoint for non-binary outputs
+    kind:        str = 'binary'        # 'binary' | 'video'
+    endpoint:    str = ''              # ws endpoint for non-binary outputs
+    format:      str = 'jpeg_binary'   # wire format hint for non-binary outputs
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +218,25 @@ _reg(OutputSpec(
     fields      = [],
     kind        = 'video',
     endpoint    = '/ws/video',
+    format      = 'jpeg_binary',
+))
+
+_reg(OutputSpec(
+    name        = 'data_layer_stream',
+    description = (
+        'Transparent RGBA PNG frames containing only the annotation layer — '
+        'bounding boxes and emotion labels on a fully transparent background. '
+        'No camera image. Composite over the raw video feed to keep video and '
+        'annotations as independent layers. '
+        'WebSocket: /ws/data_layer at camera rate (~15–30 fps) — '
+        'set ws.binaryType = "arraybuffer" and decode each message as PNG. '
+        'MJPEG: /video_data_layer as multipart/x-mixed-replace with image/png parts.'
+    ),
+    extract     = None,
+    fields      = [],
+    kind        = 'video',
+    endpoint    = '/ws/data_layer',
+    format      = 'png_binary',
 ))
 
 
@@ -282,7 +302,7 @@ def spec_description(spec: OutputSpec) -> dict:
         base['schema']   = schema_description(single_schema)
     else:
         base['endpoint'] = spec.endpoint
-        base['format']   = 'jpeg_binary'
+        base['format']   = spec.format
     return base
 
 

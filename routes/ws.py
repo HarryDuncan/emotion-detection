@@ -39,7 +39,7 @@ from flask import request
 from flask_sock import Sock
 
 import state as _state
-from frame_utils import annotate_frame, get_background_remover
+from frame_utils import annotate_data_layer, annotate_frame, get_background_remover
 from output_registry import DEFAULT_SCHEMA, DEFAULT_SPECS, run_extractors
 from routes.registry import FieldSpec, define
 
@@ -178,11 +178,7 @@ def _video_stream(ws):
             # Remove background — initialises MediaPipe on first call (lazy).
             frame = get_background_remover().remove(frame)
 
-            # Read latest emotion result — already computed by the inference loop.
-            with _state.emotion_result_lock:
-                result = dict(_state.latest_emotion_result)
-
-            annotate_frame(frame, result)
+            
 
             ret, buf = cv2.imencode('.jpg', frame, _jpeg_params)
             if ret:
@@ -194,3 +190,63 @@ def _video_stream(ws):
         with _state.emotion_client_lock:
             _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
         print(f"[ws/video] stream stopped   active={_state.emotion_active_clients}")
+
+
+# ---------------------------------------------------------------------------
+# /ws/data_layer — annotation-only transparent PNG stream
+# ---------------------------------------------------------------------------
+
+define(
+    name        = 'ws_data_layer',
+    path        = '/ws/data_layer',
+    methods     = ['WEBSOCKET'],
+    description = (
+        'WebSocket stream of transparent RGBA PNG frames containing only the '
+        'annotation layer (bounding boxes and emotion labels). No camera image '
+        'is included. Composite over /ws/video or /video_feed on a canvas element. '
+        'Frontend: set ws.binaryType = "arraybuffer", decode with createImageBitmap.'
+    ),
+    factory     = True,
+    output      = {
+        'png_frame': FieldSpec('binary', 'Raw RGBA PNG bytes — transparent frame with annotation shapes only'),
+    },
+)
+
+@sock.route('/ws/data_layer')
+def ws_data_layer_endpoint(ws):
+    _data_layer_stream(ws)
+
+
+def _data_layer_stream(ws):
+    """Activate inference, send transparent annotation PNG frames until the client disconnects."""
+    with _state.emotion_client_lock:
+        _state.emotion_active_clients += 1
+    print(f"[ws/data_layer] stream started   active={_state.emotion_active_clients}")
+
+    last_seq = -1
+    try:
+        while True:
+            with _state.frame_condition:
+                _state.frame_condition.wait_for(
+                    lambda: _state.frame_seq != last_seq, timeout=1.0
+                )
+                frame    = _state.latest_frame_flipped
+                last_seq = _state.frame_seq
+
+            h, w = frame.shape[:2] if frame is not None else (480, 640)
+
+            with _state.emotion_result_lock:
+                result = dict(_state.latest_emotion_result)
+
+            canvas = annotate_data_layer(result, h, w)
+
+            ret, buf = cv2.imencode('.png', canvas)
+            if ret:
+                ws.send(buf.tobytes())
+
+    except Exception as e:
+        print(f"[ws/data_layer] stream error: {type(e).__name__}: {e}")
+    finally:
+        with _state.emotion_client_lock:
+            _state.emotion_active_clients = max(0, _state.emotion_active_clients - 1)
+        print(f"[ws/data_layer] stream stopped   active={_state.emotion_active_clients}")

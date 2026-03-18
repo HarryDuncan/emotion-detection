@@ -81,7 +81,8 @@ output_config_lock    = threading.Lock()
 output_config         = None    # list[str] | None — full config including non-binary names
 compiled_schema       = None    # BinarySchema | None
 compiled_specs        = None    # list[OutputSpec] | None
-video_stream_enabled  = False   # True when 'video_stream' is in the active config
+video_stream_enabled       = False   # True when 'video_stream' is in the active config
+data_layer_stream_enabled  = False   # True when 'data_layer_stream' is in the active config
 
 # ---------------------------------------------------------------------------
 # Lifecycle

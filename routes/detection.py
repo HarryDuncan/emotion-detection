@@ -298,24 +298,29 @@ def set_config():
         }), 400
 
     # Binary extractors → compiled schema for /ws frames.
-    # Non-binary outputs (e.g. video_stream) are handled by dedicated endpoints.
-    schema, specs   = compile_schema(names)
-    video_enabled   = 'video_stream' in names
+    # Non-binary outputs (e.g. video_stream, data_layer_stream) are handled by
+    # their own dedicated endpoints.
+    schema, specs        = compile_schema(names)
+    video_enabled        = 'video_stream' in names
+    data_layer_enabled   = 'data_layer_stream' in names
 
     with _state.output_config_lock:
-        _state.output_config          = names
-        _state.compiled_schema        = schema
-        _state.compiled_specs         = specs
-        _state.video_stream_enabled   = video_enabled
+        _state.output_config               = names
+        _state.compiled_schema             = schema
+        _state.compiled_specs              = specs
+        _state.video_stream_enabled        = video_enabled
+        _state.data_layer_stream_enabled   = data_layer_enabled
 
-    print(f'[set-config] config={names}  video={video_enabled}  schema={schema}')
+    print(f'[set-config] config={names}  video={video_enabled}  data_layer={data_layer_enabled}  schema={schema}')
     return jsonify({
-        'config':         names,
-        'schema':         schema_description(schema),
-        'video_stream':   video_enabled,
+        'config':               names,
+        'schema':               schema_description(schema),
+        'video_stream':         video_enabled,
+        'data_layer_stream':    data_layer_enabled,
         'streams': {
-            '/ws':        'binary model data (always active when config set)',
-            '/ws/video':  'annotated JPEG frames' if video_enabled else None,
+            '/ws':              'binary model data (always active when config set)',
+            '/ws/video':        'annotated JPEG frames' if video_enabled else None,
+            '/ws/data_layer':   'transparent PNG annotation layer' if data_layer_enabled else None,
         },
     })
 
@@ -323,23 +328,27 @@ def set_config():
 @bp.route('/get-config', methods=['GET'])
 def get_config():
     with _state.output_config_lock:
-        config        = _state.output_config
-        schema        = _state.compiled_schema
-        video_enabled = _state.video_stream_enabled
+        config             = _state.output_config
+        schema             = _state.compiled_schema
+        video_enabled      = _state.video_stream_enabled
+        data_layer_enabled = _state.data_layer_stream_enabled
 
     if config is None or schema is None:
         from output_registry import DEFAULT_SCHEMA
-        config        = DEFAULT_CONFIG
-        schema        = DEFAULT_SCHEMA
-        video_enabled = False
+        config             = DEFAULT_CONFIG
+        schema             = DEFAULT_SCHEMA
+        video_enabled      = False
+        data_layer_enabled = False
 
     return jsonify({
-        'config':       config,
-        'schema':       schema_description(schema),
-        'video_stream': video_enabled,
+        'config':             config,
+        'schema':             schema_description(schema),
+        'video_stream':       video_enabled,
+        'data_layer_stream':  data_layer_enabled,
         'streams': {
-            '/ws':       'binary model data (always active when config set)',
-            '/ws/video': 'annotated JPEG frames' if video_enabled else None,
+            '/ws':            'binary model data (always active when config set)',
+            '/ws/video':      'annotated JPEG frames' if video_enabled else None,
+            '/ws/data_layer': 'transparent PNG annotation layer' if data_layer_enabled else None,
         },
     })
 

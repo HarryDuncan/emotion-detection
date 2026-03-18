@@ -116,6 +116,43 @@ def get_background_remover() -> BackgroundRemover:
     return _remover_instance
 
 
+def annotate_data_layer(result: dict, height: int, width: int) -> np.ndarray:
+    """Return a transparent BGRA canvas with only the annotation layer drawn.
+
+    All pixels start fully transparent (alpha=0). Drawn shapes (bounding boxes,
+    label backgrounds, text) are fully opaque (alpha=255). Encode the returned
+    array as PNG to preserve the alpha channel — JPEG cannot represent transparency.
+
+    Parameters
+    ----------
+    result:
+        The latest emotion result dict (same format as ``annotate_frame``).
+    height, width:
+        Canvas dimensions — should match the corresponding video frame so the
+        overlay lines up when composited in the browser.
+    """
+    canvas = np.zeros((height, width, 4), dtype=np.uint8)
+
+    for face in result.get('faces', []):
+        x, y, w, h  = face['face_bbox']
+        b, g, r     = face['emotion_color_bgr']
+        label       = face.get('dominant_emotion', '')
+        color_bgra  = (b, g, r, 255)
+
+        cv2.rectangle(canvas, (x, y), (x + w, y + h), color_bgra, 2)
+
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+        ty          = max(y - 6, th + 4)
+        cv2.rectangle(canvas, (x, ty - th - 4), (x + tw + 4, ty + 2), color_bgra, cv2.FILLED)
+
+        luma        = 0.299 * r + 0.587 * g + 0.114 * b
+        text_color  = (0, 0, 0, 255) if luma > 140 else (255, 255, 255, 255)
+        cv2.putText(canvas, label, (x + 2, ty),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1, cv2.LINE_AA)
+
+    return canvas
+
+
 def annotate_frame(frame, result: dict) -> None:
     """Draw per-face emotion bounding boxes and labels onto *frame* in-place.
 

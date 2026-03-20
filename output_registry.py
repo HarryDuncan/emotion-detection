@@ -56,22 +56,32 @@ class OutputSpec:
     """
     Describes one named model output.
 
-    name        — unique key used in set-config requests
-    description — shown in GET /available-outputs
-    extract     — callable(detection_result: dict) → flat dict of values
-                  None for non-binary outputs (e.g. video_stream)
-    fields      — binary fields this extractor contributes to the packed frame
-                  empty list for non-binary outputs
-    kind        — 'binary' (packed into /ws frames) | 'video' (separate stream)
-    endpoint    — WebSocket endpoint URL for kind='video'; empty for kind='binary'
+    name            — unique key used in set-config requests
+    description     — shown in GET /available-outputs
+    extract         — callable(detection_result: dict) → flat dict of values
+                      None for non-binary outputs (e.g. video_stream)
+    fields          — binary fields this extractor contributes to the packed frame
+                      empty list for non-binary outputs
+    kind            — 'binary' (packed into /ws frames) | 'video' (separate stream)
+    endpoint        — WebSocket endpoint URL for kind='video'; empty for kind='binary'
+    is_array        — True when the payload is a fixed-length array of uniform items.
+                      Wire format is identical to a plain binary spec; this flag lets
+                      JS clients use Float32Array + uniform2fv/uniform3fv directly
+                      instead of parsing each field individually with DataView.
+    array_length    — Number of items in the array (e.g. 6 face slots). 0 if not an array.
+    item_components — Number of float32 components per item (e.g. 2 for vec2, 3 for vec3).
+                      item_stride_bytes = item_components × 4.  0 if not an array.
     """
-    name:        str
-    description: str
-    extract:     object   # Callable[[dict], dict] | None
-    fields:      list     # list[Field]
-    kind:        str = 'binary'        # 'binary' | 'video'
-    endpoint:    str = ''              # ws endpoint for non-binary outputs
-    format:      str = 'jpeg_binary'   # wire format hint for non-binary outputs
+    name:            str
+    description:     str
+    extract:         object   # Callable[[dict], dict] | None
+    fields:          list     # list[Field]
+    kind:            str = 'binary'        # 'binary' | 'video'
+    endpoint:        str = ''              # ws endpoint for non-binary outputs
+    format:          str = 'jpeg_binary'   # wire format hint for non-binary outputs
+    is_array:        bool = False
+    array_length:    int  = 0
+    item_components: int  = 0
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +145,69 @@ def extract_face_bbox(result: dict) -> dict:
         return {'bbox_x': 0, 'bbox_y': 0, 'bbox_w': 0, 'bbox_h': 0}
     x, y, w, h = face.get('face_bbox') or (0, 0, 0, 0)
     return {'bbox_x': int(x), 'bbox_y': int(y), 'bbox_w': int(w), 'bbox_h': int(h)}
+
+
+# Maximum number of simultaneous faces tracked across all multi-face outputs.
+# Both face_positions and face_colors use this constant so slot i is always
+# the same face in both outputs within a single frame.
+_FACE_SLOTS = 6
+
+
+def extract_face_positions(result: dict) -> dict:
+    """
+    Normalised UV centre for up to _FACE_SLOTS faces.
+
+    Per slot i (0 … 5):
+        face_i_pos_x  float32  0.0–1.0, -1.0 = empty
+        face_i_pos_y  float32  0.0–1.0, -1.0 = empty
+
+    Origin top-left; x right, y down (image convention).
+    Flip y in the shader (1.0 - y) to match WebGL UV space.
+    Wire size: 6 × 2 × 4 = 48 bytes.
+    """
+    faces = _faces(result)[:_FACE_SLOTS]
+    fw    = result.get('frame_width')  or 1
+    fh    = result.get('frame_height') or 1
+    flat: dict = {}
+    for i in range(_FACE_SLOTS):
+        if i < len(faces):
+            x, y, w, h = faces[i].get('face_bbox') or (0, 0, 0, 0)
+            flat[f'face_{i}_pos_x'] = float(x + w * 0.5) / fw
+            flat[f'face_{i}_pos_y'] = float(y + h * 0.5) / fh
+        else:
+            flat[f'face_{i}_pos_x'] = -1.0
+            flat[f'face_{i}_pos_y'] = -1.0
+    return flat
+
+
+def extract_face_colors(result: dict) -> dict:
+    """
+    Dominant emotion colour for up to _FACE_SLOTS faces.
+
+    Slot ordering is identical to extract_face_positions — slot i refers to
+    the same face in both outputs so they can be used independently or together.
+
+    Per slot i (0 … 5):
+        face_i_color_r  float32  0.0–1.0
+        face_i_color_g  float32  0.0–1.0
+        face_i_color_b  float32  0.0–1.0
+
+    Empty slots have color (0.0, 0.0, 0.0).
+    Wire size: 6 × 3 × 4 = 72 bytes.
+    """
+    faces = _faces(result)[:_FACE_SLOTS]
+    flat: dict = {}
+    for i in range(_FACE_SLOTS):
+        if i < len(faces):
+            rgb = list(faces[i].get('emotion_color_rgb') or (0, 0, 0))
+            flat[f'face_{i}_color_r'] = float(rgb[0]) / 255.0
+            flat[f'face_{i}_color_g'] = float(rgb[1]) / 255.0
+            flat[f'face_{i}_color_b'] = float(rgb[2]) / 255.0
+        else:
+            flat[f'face_{i}_color_r'] = 0.0
+            flat[f'face_{i}_color_g'] = 0.0
+            flat[f'face_{i}_color_b'] = 0.0
+    return flat
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +278,47 @@ _reg(OutputSpec(
         Field('bbox_w', 'i', lambda d: d.get('bbox_w', 0)),
         Field('bbox_h', 'i', lambda d: d.get('bbox_h', 0)),
     ],
+))
+
+_reg(OutputSpec(
+    name            = 'face_positions',
+    description     = (
+        f'Normalised UV centre for up to {_FACE_SLOTS} faces (48 bytes). '
+        f'Fixed array of {_FACE_SLOTS} slots × (pos_x f32, pos_y f32). '
+        'Origin top-left; flip pos_y in shader (1.0 - y) for WebGL UV space. '
+        'Slot i matches slot i in face_colors. '
+        'Empty slots: pos_x = pos_y = -1.0.'
+    ),
+    extract         = extract_face_positions,
+    fields          = [
+        Field(f'face_{i}_{c}', 'f',
+              (lambda k: lambda d: d.get(k, -1.0))(f'face_{i}_{c}'))
+        for i in range(_FACE_SLOTS)
+        for c in ('pos_x', 'pos_y')
+    ],
+    is_array        = True,
+    array_length    = _FACE_SLOTS,
+    item_components = 2,   # vec2
+))
+
+_reg(OutputSpec(
+    name            = 'face_colors',
+    description     = (
+        f'Dominant emotion colour for up to {_FACE_SLOTS} faces (72 bytes). '
+        f'Fixed array of {_FACE_SLOTS} slots × (color_r f32, color_g f32, color_b f32), each 0.0–1.0. '
+        'Slot i matches slot i in face_positions. '
+        'Empty slots: all zeros.'
+    ),
+    extract         = extract_face_colors,
+    fields          = [
+        Field(f'face_{i}_{c}', 'f',
+              (lambda k: lambda d: d.get(k, 0.0))(f'face_{i}_{c}'))
+        for i in range(_FACE_SLOTS)
+        for c in ('color_r', 'color_g', 'color_b')
+    ],
+    is_array        = True,
+    array_length    = _FACE_SLOTS,
+    item_components = 3,   # vec3
 ))
 
 _reg(OutputSpec(
@@ -291,6 +405,17 @@ def spec_description(spec: OutputSpec) -> dict:
     """
     Describe one OutputSpec in a JSON-serialisable form for GET /available-outputs.
     Binary specs include a binary schema layout; video specs include their endpoint.
+
+    Array specs additionally include:
+        is_array        — always True
+        array_length    — number of items (e.g. 6 face slots)
+        item_components — float32 values per item (e.g. 2 = vec2, 3 = vec3)
+        item_stride     — bytes per item (item_components × 4)
+
+    JS usage for array specs:
+        const arr = new Float32Array(buffer, byteOffset, array_length * item_components);
+        gl.uniform2fv(loc, arr);  // item_components=2
+        gl.uniform3fv(loc, arr);  // item_components=3
     """
     base = {
         'name':        spec.name,
@@ -300,6 +425,11 @@ def spec_description(spec: OutputSpec) -> dict:
     if spec.kind == 'binary':
         single_schema, _ = compile_schema([spec.name])
         base['schema']   = schema_description(single_schema)
+        if spec.is_array:
+            base['is_array']        = True
+            base['array_length']    = spec.array_length
+            base['item_components'] = spec.item_components
+            base['item_stride']     = spec.item_components * 4
     else:
         base['endpoint'] = spec.endpoint
         base['format']   = spec.format

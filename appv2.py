@@ -2,10 +2,10 @@ import os
 
 # Suppress TensorFlow and ABSL logs before any import that touches TF.
 # TF_CPP_MIN_LOG_LEVEL: 0=all, 1=no INFO, 2=no WARNING, 3=no ERROR (only FATAL)
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-# GLOG_minloglevel suppresses the W0000/I0000 ABSL-format lines (gpu_timer spam etc.)
-# 0=INFO 1=WARNING 2=ERROR 3=FATAL
-os.environ.setdefault("GLOG_minloglevel", "2")
+# GLOG_minloglevel: 0=INFO 1=WARNING 2=ERROR 3=FATAL — silences W0000 gpu_timer spam
+# Hard-assign (not setdefault) so container env vars cannot re-enable noisy levels.
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['GLOG_minloglevel']      = '3'
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 os.environ["CUDA_CACHE_MAXSIZE"] = "2147483648"
 # Silence OpenCV libjpeg warnings from MJPG frames received over USBIPD.
@@ -129,6 +129,9 @@ def _emotion_inference_loop():
             frame = _state.latest_frame_flipped
         if frame is not None:
             result = emotion_detector.detect_emotions_from_frame(frame, silent=True)
+            h, w = frame.shape[:2]
+            result['frame_width']  = w
+            result['frame_height'] = h
             with _state.emotion_result_lock:
                 _state.latest_emotion_result.clear()
                 _state.latest_emotion_result.update(result)

@@ -24,6 +24,10 @@ services:
       # Get WSL2 IP with: ip addr show eth0 | grep 'inet ' (run in WSL)
       # gst-launch-1.0 ksvideosrc ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=superfast ! rtph264pay config-interval=-1 ! udpsink host=192.168.0.159 port=5001
       - CAMERA_GST_PIPELINE=udpsrc port=5001 ! application/x-rtp,encoding-name=H264,payload=96 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink
+      # Second camera (optional — dual-camera auto-switching). See docs/camera-input.md
+      # Windows sender: gst-launch-1.0 ksvideosrc device-index=1 ! videoconvert ! x264enc tune=zerolatency bitrate=2000 speed-preset=superfast ! rtph264pay config-interval=-1 ! udpsink host=<WSL2_IP> port=5002
+      # - CAMERA_GST_PIPELINE_2=udpsrc port=5002 ! application/x-rtp,encoding-name=H264,payload=96 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink
+      # - CAMERA_SWITCH_INTERVAL=20
     deploy:
       resources:
         reservations:

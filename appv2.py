@@ -61,44 +61,83 @@ socketio.init_app(
 # (child process only) so Flask's reloader parent never triggers a GPU load.
 emotion_detector = EmotionDetector(load_models_on_init=False)
 
-# CAMERA_GST_PIPELINE: raw GStreamer pipeline (overrides camera_url/camera_index).
-# Example: "udpsrc port=5000 ! application/x-rtp,payload=96 ! rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! appsink"
-_camera_config = {
-    **DEFAULT_CAMERA_CONFIG,
-    "camera_gst_pipeline": os.environ.get("CAMERA_GST_PIPELINE") or None,
-    "camera_url":   None,
-    "camera_index": int(os.environ.get("CAMERA_INDEX", 0)),
-}
-camera_input = CameraInput(_camera_config)
-_state.camera_input     = camera_input      # expose to route blueprints via state
-_state.emotion_detector = emotion_detector  # expose to route blueprints via state
+# Camera inputs — one or two pipelines.  When two are configured, the reader
+# thread auto-switches between them every CAMERA_SWITCH_INTERVAL seconds.
+# Both pipelines run in parallel so the switch is a zero-downtime pointer swap.
+_camera_configs = [
+    {
+        **DEFAULT_CAMERA_CONFIG,
+        "camera_gst_pipeline": os.environ.get("CAMERA_GST_PIPELINE") or None,
+        "camera_url":   None,
+        "camera_index": int(os.environ.get("CAMERA_INDEX", 0)),
+    },
+]
+_pipeline_2 = os.environ.get("CAMERA_GST_PIPELINE_2") or None
+if _pipeline_2:
+    _camera_configs.append({
+        **DEFAULT_CAMERA_CONFIG,
+        "camera_gst_pipeline": _pipeline_2,
+        "camera_url":   None,
+        "camera_index": int(os.environ.get("CAMERA_INDEX_2", 1)),
+    })
+
+camera_inputs = [CameraInput(cfg) for cfg in _camera_configs]
+_state.camera_input     = camera_inputs[0]   # primary — exposed to route blueprints
+_state.emotion_detector = emotion_detector
+
+CAMERA_SWITCH_INTERVAL = float(os.environ.get("CAMERA_SWITCH_INTERVAL", "20"))
 
 # ---------------------------------------------------------------------------
 # Camera reader thread
 # The only thread that ever calls camera_input.read_latest().
 # Writes new frames into state and signals all waiting generators.
+#
+# When two cameras are configured, the loop auto-switches between them on a
+# timer.  Both GStreamer pipelines run continuously — the inactive one keeps
+# decoding with max-buffers=1/drop=true, so its buffer always holds the
+# freshest frame.  Switching is just a pointer swap: no pipeline restart,
+# no cold-start delay.
 # ---------------------------------------------------------------------------
 
-EMOTION_FPS = 30   # RetinaFace inference is slow; 8 fps is plenty
+EMOTION_FPS = 30
 
 def _camera_reader_loop():
-    print("[camera] Reader thread started")
-    read_count = 0
+    multi       = len(camera_inputs) > 1
+    active_idx  = 0
+    active      = camera_inputs[active_idx]
+    last_switch = time.time()
+
+    if multi:
+        print(f"[camera] Reader thread started — {len(camera_inputs)} cameras, "
+              f"switching every {CAMERA_SWITCH_INTERVAL}s")
+    else:
+        print("[camera] Reader thread started")
+
     while not _state.stop_event.is_set():
-        if not camera_input.isOpened():
+        # --- auto-switch ---
+        if multi and CAMERA_SWITCH_INTERVAL > 0:
+            now = time.time()
+            if now - last_switch >= CAMERA_SWITCH_INTERVAL:
+                active_idx = (active_idx + 1) % len(camera_inputs)
+                active     = camera_inputs[active_idx]
+                last_switch = now
+                emotion_detector._tracks.clear()
+                print(f"[camera] Switched to camera {active_idx}")
+
+        if not active.isOpened():
             time.sleep(0.1)
             continue
-        t_before = time.time()
-        ret, frame = camera_input.read_latest()
-        t_read = time.time()
+
+        ret, frame = active.read_latest()
         if ret and frame is not None:
             flipped = cv2.flip(frame, 1)
             with _state.frame_condition:
                 _state.latest_frame         = frame
                 _state.latest_frame_flipped = flipped
-                _state.frame_timestamp      = t_read
+                _state.frame_timestamp      = time.time()
                 _state.frame_seq           += 1
                 _state.frame_condition.notify_all()
+
     with _state.frame_condition:
         _state.latest_frame         = None
         _state.latest_frame_flipped = None
@@ -192,19 +231,23 @@ def initialize_system():
     _state.stop_event.clear()
 
     # ------------------------------------------------------------------
-    # Phase 1: camera
+    # Phase 1: cameras
     # ------------------------------------------------------------------
-    try:
-        camera_input._initialize_camera()
-        if camera_input.isOpened():
-            print(f"[init] Camera ready — device index {_camera_config.get('camera_index', 0)}")
-            _state.initialization_status['camera_ready'] = True
-        else:
-            print("[init] No camera available — video feed will show placeholder.")
-            _state.initialization_status['camera_ready'] = False
-    except Exception as e:
-        print(f"[init] Camera init failed: {e}")
-        _state.initialization_status['camera_ready'] = False
+    any_opened = False
+    for i, cam in enumerate(camera_inputs):
+        try:
+            cam._initialize_camera()
+            if cam.isOpened():
+                print(f"[init] Camera {i} ready")
+                any_opened = True
+            else:
+                print(f"[init] Camera {i} — not available")
+        except Exception as e:
+            print(f"[init] Camera {i} init failed: {e}")
+
+    _state.initialization_status['camera_ready'] = any_opened
+    if not any_opened:
+        print("[init] No cameras available — video feed will show placeholder.")
 
     # Camera reader runs immediately; /video_feed is usable from this point.
     threading.Thread(target=_camera_reader_loop, daemon=True, name="camera-reader").start()
@@ -243,10 +286,11 @@ def _shutdown(signum=None, frame=None):
     print(f"[shutdown] Stopping background threads (signal={signum})...")
     _state.stop_event.set()
     time.sleep(0.15)
-    try:
-        camera_input.release()
-    except Exception:
-        pass
+    for cam in camera_inputs:
+        try:
+            cam.release()
+        except Exception:
+            pass
     try:
         emotion_detector.cleanup()
     except Exception:

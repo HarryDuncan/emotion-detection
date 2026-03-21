@@ -31,6 +31,7 @@ from routes.registry     import bp as registry_bp
 from routes.core         import bp as core_bp
 from routes.video        import bp as video_bp
 from routes.detection    import bp as detection_bp
+from routes.ollama       import bp as ollama_bp
 from routes.ws           import sock as _ws_sock   # raw WebSocket /ws endpoint
 import routes.socket_events as _socket_events      # registers @socketio.on handlers
 
@@ -45,6 +46,7 @@ app.register_blueprint(registry_bp)
 app.register_blueprint(core_bp)
 app.register_blueprint(video_bp)
 app.register_blueprint(detection_bp)
+app.register_blueprint(ollama_bp)
 _ws_sock.init_app(app)   # registers /ws raw WebSocket route
 
 socketio.init_app(
@@ -99,7 +101,7 @@ CAMERA_SWITCH_INTERVAL = float(os.environ.get("CAMERA_SWITCH_INTERVAL", "20"))
 # no cold-start delay.
 # ---------------------------------------------------------------------------
 
-EMOTION_FPS = 30
+EMOTION_FPS = 18
 
 def _camera_reader_loop():
     multi       = len(camera_inputs) > 1

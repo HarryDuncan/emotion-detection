@@ -24,6 +24,7 @@ import urllib.request
 import cv2
 import mediapipe as mp                          # must stay at module level
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 from mediapipe.tasks import python as _mp_py
 from mediapipe.tasks.python import vision as _mp_vision
 
@@ -38,6 +39,49 @@ _EMOTION_COLORS_BGR: dict[str, tuple] = {
 _FONT       = cv2.FONT_HERSHEY_SIMPLEX
 _FONT_SCALE = 0.45
 _FONT_THICK = 1
+
+DATA_LAYER_PAD = 200
+
+# HUD fonts (PIL TrueType) — loaded lazily on first draw
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+_DATATYPE = os.path.join(_FONT_DIR, 'Datatype_Expanded-Regular.ttf')
+_hud_fonts: dict | None = None
+
+
+def _get_hud_fonts() -> dict:
+    global _hud_fonts
+    if _hud_fonts is None:
+        try:
+            _hud_fonts = {
+                'label': ImageFont.truetype(_DATATYPE, 16),
+                'value': ImageFont.truetype(_DATATYPE, 16),
+                'mono':  ImageFont.truetype(_DATATYPE, 16),
+                'text':  ImageFont.truetype(_DATATYPE, 15),
+            }
+        except OSError:
+            fallback = ImageFont.load_default()
+            _hud_fonts = {k: fallback for k in ('label', 'value', 'mono', 'text')}
+            print('[hud] Datatype font not found — using PIL default')
+    return _hud_fonts
+
+
+def _wrap_text_pil(draw: ImageDraw.ImageDraw, text: str,
+                   font: ImageFont.FreeTypeFont, max_width: int) -> str:
+    """Word-wrap *text* so each line fits within *max_width* pixels."""
+    words = text.split()
+    lines: list[str] = []
+    current = ''
+    for word in words:
+        test = f'{current} {word}'.strip()
+        if draw.textlength(test, font=font) <= max_width:
+            current = test
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return '\n'.join(lines)
 
 _MODEL_URL  = (
     'https://storage.googleapis.com/mediapipe-models/'
@@ -128,6 +172,19 @@ def get_background_remover() -> BackgroundRemover:
     return _remover_instance
 
 
+def colorize_frame(frame: np.ndarray, bgr: tuple,
+                   strength: float = 0.25) -> np.ndarray:
+    """Apply a colour wash over *frame* using an alpha blend.
+
+    *bgr* is the tint colour in BGR order.  *strength* (0.0–1.0) controls
+    how dominant the tint is — 0.0 returns the original frame, 1.0 replaces
+    it entirely with the solid colour.  0.25 gives a noticeable but
+    non-destructive tint.
+    """
+    overlay = np.full_like(frame, bgr, dtype=np.uint8)
+    return cv2.addWeighted(frame, 1.0 - strength, overlay, strength, 0)
+
+
 def _top3_lines(face: dict) -> list[tuple[str, tuple]]:
     """Return [(label_str, bgr_color), ...] for the top-3 emotions by score.
 
@@ -151,13 +208,16 @@ def _text_color(bgr: tuple, *, alpha: int | None = None) -> tuple:
     return (*base, alpha) if alpha is not None else base
 
 
-def _draw_top3(canvas: np.ndarray, face: dict) -> None:
+def _draw_top3(canvas: np.ndarray, face: dict, *, y_offset: int = 0) -> None:
     """Draw bounding box and top-3 emotion labels onto *canvas* in-place.
 
     Handles both 3-channel BGR frames and 4-channel BGRA transparent canvases.
     Each of the three label rows uses the individual emotion's palette color so
     the blend is visible at a glance. Rows are stacked immediately above the
     bounding box, ordered 1st (top) → 3rd (bottom).
+
+    *y_offset* shifts all drawing downward (used by the expanded data-layer
+    canvas to centre the tracking area below the HUD strip).
     """
     n_ch       = canvas.shape[2]
     alpha      = 255 if n_ch == 4 else None   # None → omit alpha component
@@ -166,6 +226,7 @@ def _draw_top3(canvas: np.ndarray, face: dict) -> None:
         return (*bgr, alpha) if alpha is not None else bgr
 
     x, y, w, h  = face['face_bbox']
+    y += y_offset
     bbox_color  = face['emotion_color_bgr']
 
     cv2.rectangle(canvas, (x, y), (x + w, y + h), _c(bbox_color), 2)
@@ -184,26 +245,202 @@ def _draw_top3(canvas: np.ndarray, face: dict) -> None:
         cursor_y = top - 2      # 2 px gap between rows
 
 
-def annotate_data_layer(result: dict, height: int, width: int) -> np.ndarray:
-    """Return a transparent BGRA canvas with only the annotation layer drawn.
+def _draw_hud(canvas: np.ndarray, pad: int, width: int,
+              elapsed_s: float, status: str, subjects: int,
+              llm_text: str = '') -> None:
+    """Draw compact status bar + LLM text area into the top *pad* pixels."""
+    fonts   = _get_hud_fonts()
+    margin  = 20
 
-    All pixels start fully transparent (alpha=0). Drawn shapes (bounding boxes,
-    label backgrounds, text) are fully opaque (alpha=255). Encode the returned
-    array as PNG to preserve the alpha channel — JPEG cannot represent transparency.
+    hud  = Image.new('RGBA', (width, pad), (15, 15, 15, 180))
+    draw = ImageDraw.Draw(hud)
 
-    Each face shows the top-3 emotions by score, each row colored with its own
-    emotion palette color, stacked above the bounding box.
+    # ── compact status bar (top ~30 px) ──────────────────────────────────
+    total_s    = int(elapsed_s)
+    ms         = int((elapsed_s - total_s) * 1000)
+    hrs, rem   = divmod(total_s, 3600)
+    mins, secs = divmod(rem, 60)
+    timer_val  = (f'{hrs:02d}:{mins:02d}:{secs:02d}.{ms:03d}'
+                  if hrs else f'{mins:02d}:{secs:02d}.{ms:03d}')
+
+    dim   = (100, 100, 100, 255)
+    bright = (220, 220, 220, 255)
+    bar_y = 8
+    font  = fonts['label']
+
+    sections = [
+        (f'TIMER  {timer_val}',            0.0),
+        (f'STATUS  {status}',              0.33),
+        (f'SUBJECTS DETECTED  {subjects}', 0.66),
+    ]
+    for text, frac in sections:
+        x = int(width * frac) + margin
+        draw.text((x, bar_y), text, fill=bright, font=font)
+
+    # separator
+    sep_y = 34
+    draw.line([(margin, sep_y), (width - margin, sep_y)], fill=dim, width=1)
+
+    # ── LLM text area ───────────────────────────────────────────────────
+    if llm_text:
+        text_font  = fonts['text']
+        max_w      = width - 2 * margin
+        wrapped    = _wrap_text_pil(draw, llm_text, text_font, max_w)
+        draw.multiline_text((margin, sep_y + 8), wrapped,
+                            fill=(200, 200, 200, 255), font=text_font,
+                            spacing=5)
+
+    # bottom accent
+    draw.line([(0, pad - 1), (width - 1, pad - 1)],
+              fill=(80, 80, 80, 255), width=1)
+
+    # RGBA → BGRA into the canvas slice
+    rgba = np.array(hud)
+    canvas[:pad, :, 0] = rgba[:, :, 2]
+    canvas[:pad, :, 1] = rgba[:, :, 1]
+    canvas[:pad, :, 2] = rgba[:, :, 0]
+    canvas[:pad, :, 3] = rgba[:, :, 3]
+
+
+def _draw_stats_panel(canvas: np.ndarray, pad: int, width: int,
+                      total_h: int, stats: dict) -> None:
+    """Draw long-running session statistics into the bottom *pad* pixels.
+
+    Stats dict keys:
+        top3            — list of (emotion_name, count) for the top 3 emotions
+        change_count    — total number of dominant-emotion transitions
+        emotion_counts  — {emotion_name: times_experienced}
+    """
+    fonts   = _get_hud_fonts()
+    margin  = 20
+
+    panel = Image.new('RGBA', (width, pad), (15, 15, 15, 180))
+    draw  = ImageDraw.Draw(panel)
+
+    dim    = (100, 100, 100, 255)
+    bright = (220, 220, 220, 255)
+    accent = (180, 180, 180, 255)
+    font   = fonts['label']
+    val_font = fonts['value']
+
+    # top accent line
+    draw.line([(0, 0), (width - 1, 0)], fill=(80, 80, 80, 255), width=1)
+
+    # ── header bar ────────────────────────────────────────────────────────
+    bar_y = 10
+    draw.text((margin, bar_y), 'SESSION STATISTICS', fill=bright, font=font)
+
+    change_count = stats.get('change_count', 0)
+    changes_txt = f'EMOTION CHANGES  {change_count}'
+    cw = draw.textlength(changes_txt, font=font)
+    draw.text((width - margin - cw, bar_y), changes_txt,
+              fill=bright, font=font)
+
+    sep_y = 32
+    draw.line([(margin, sep_y), (width - margin, sep_y)], fill=dim, width=1)
+
+    # ── top 3 emotions (left column) ──────────────────────────────────────
+    col1_x = margin
+    row_y  = sep_y + 10
+    draw.text((col1_x, row_y), 'TOP EMOTIONS', fill=dim, font=font)
+    row_y += 22
+
+    top3 = stats.get('top3', [])
+    for rank, (emo, count) in enumerate(top3, 1):
+        rgb = _EMOTION_COLORS_RGB.get(emo.lower(), (180, 180, 180))
+        color_rgba = (*rgb, 255)
+
+        pill_w = 8
+        pill_h = 8
+        pill_y = row_y + 4
+        draw.rectangle([(col1_x, pill_y), (col1_x + pill_w, pill_y + pill_h)],
+                       fill=color_rgba)
+
+        label = f'{rank}.  {emo.upper()}  ×{count}'
+        draw.text((col1_x + pill_w + 8, row_y), label,
+                  fill=bright, font=val_font)
+        row_y += 22
+
+    # ── per-emotion experience counts (right column) ──────────────────────
+    emotion_counts = stats.get('emotion_counts', {})
+    if emotion_counts:
+        col2_x = width // 2 + margin
+        row_y2 = sep_y + 10
+        draw.text((col2_x, row_y2), 'TIMES EXPERIENCED', fill=dim, font=font)
+        row_y2 += 22
+
+        sorted_emos = sorted(emotion_counts.items(),
+                             key=lambda kv: kv[1], reverse=True)
+        for emo, count in sorted_emos:
+            if count == 0:
+                continue
+            rgb = _EMOTION_COLORS_RGB.get(emo.lower(), (180, 180, 180))
+            color_rgba = (*rgb, 255)
+
+            pill_w = 8
+            pill_h = 8
+            pill_y = row_y2 + 4
+            draw.rectangle(
+                [(col2_x, pill_y), (col2_x + pill_w, pill_y + pill_h)],
+                fill=color_rgba)
+
+            label = f'{emo.upper()}  ×{count}'
+            draw.text((col2_x + pill_w + 8, row_y2), label,
+                      fill=accent, font=val_font)
+            row_y2 += 20
+
+    # RGBA → BGRA into the canvas bottom slice
+    rgba = np.array(panel)
+    y_start = total_h - pad
+    canvas[y_start:, :, 0] = rgba[:, :, 2]
+    canvas[y_start:, :, 1] = rgba[:, :, 1]
+    canvas[y_start:, :, 2] = rgba[:, :, 0]
+    canvas[y_start:, :, 3] = rgba[:, :, 3]
+
+
+def annotate_data_layer(result: dict, height: int, width: int, *,
+                        elapsed_s: float = 0.0,
+                        llm_text: str = '',
+                        stats: dict | None = None) -> np.ndarray:
+    """Return a transparent BGRA canvas with HUD strip and annotation layer.
+
+    The canvas is *height + 2 × DATA_LAYER_PAD* tall: a 200 px HUD strip on
+    top, the original-frame-sized tracking area in the centre, and 200 px of
+    transparent space at the bottom.  Bounding boxes and emotion labels are
+    drawn in the centre region; the HUD strip shows a compact status bar and
+    the current LLM narrative (typewriter-animated by the caller).
 
     Parameters
     ----------
     result:
         The latest emotion result dict from ``_state.latest_emotion_result``.
     height, width:
-        Canvas dimensions — should match the video frame for correct compositing.
+        *Original* video frame dimensions (before padding).
+    elapsed_s:
+        Seconds since the data-layer stream started — drives the timer display.
+    llm_text:
+        Visible portion of the LLM narrative (caller truncates for typewriter).
+    stats:
+        Session statistics dict with keys ``top3``, ``change_count``,
+        ``emotion_counts``.  When provided the bottom panel renders them.
     """
-    canvas = np.zeros((height, width, 4), dtype=np.uint8)
-    for face in result.get('faces', []):
-        _draw_top3(canvas, face)
+    pad     = DATA_LAYER_PAD
+    total_h = height + 2 * pad
+    canvas  = np.zeros((total_h, width, 4), dtype=np.uint8)
+
+    faces        = result.get('faces', [])
+    face_detected = result.get('face_detected', False)
+    status       = 'ACTIVE' if face_detected else 'SCANNING'
+
+    _draw_hud(canvas, pad, width, elapsed_s, status, len(faces),
+              llm_text=llm_text)
+
+    for face in faces:
+        _draw_top3(canvas, face, y_offset=pad)
+
+    if stats is not None:
+        _draw_stats_panel(canvas, pad, width, total_h, stats)
+
     return canvas
 
 

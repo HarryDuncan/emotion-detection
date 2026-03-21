@@ -85,6 +85,18 @@ video_stream_enabled       = False   # True when 'video_stream' is in the active
 data_layer_stream_enabled  = False   # True when 'data_layer_stream' is in the active config
 
 # ---------------------------------------------------------------------------
+# Ollama LLM state
+# Written by routes/ollama.py and the data-layer prompt thread.
+# ---------------------------------------------------------------------------
+ollama_connected  = False   # True after POST /ollama/connect succeeds
+ollama_base_url   = ''      # e.g. 'http://localhost:11434'
+ollama_model_name = ''      # e.g. 'emotion-ai'
+ollama_model_ready = False  # True after POST /ollama/create-model succeeds
+
+ollama_llm_text = ''        # latest LLM narrative (read by HUD renderer)
+ollama_llm_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
 # Lifecycle
 # Set by _shutdown to signal all background threads to exit.
 # ---------------------------------------------------------------------------

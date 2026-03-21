@@ -9,7 +9,7 @@ _Gst = None  # populated on first call to _initialize_camera()
 
 
 DEFAULT_CAMERA_CONFIG = {
-    'camera_fps': 15,  # 15fps keeps USB bandwidth low over USBIPD — reduces tearing from packet drops
+    'camera_fps': 18,
     'camera_index': 0,
     'camera_url': None,      # If set, overrides camera_index (e.g. "udp://@0.0.0.0:1235")
     'camera_gst_pipeline': None,  # If set, used directly (e.g. UDP RTP H264: "udpsrc port=5000 ! ...")
